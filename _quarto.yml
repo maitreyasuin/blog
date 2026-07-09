@@ -3,12 +3,13 @@ project:
 
 website:
   description: "A blog built with Quarto"
+  site-url: https://maitreyasuin.github.io/blog
   title: "My Blog"
   navbar:
     right:
       - about.qmd
       - icon: github
-        href: https://github.com/
+        href: https://github.com/maitreyasuin/blog
 
 format:
   html:
