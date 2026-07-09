@@ -1,0 +1,292 @@
+---
+title: "FlashAttention from First Principles: Exact Attention Without the O(n²) Memory"
+description: "Standard attention is slow because of memory traffic, not FLOPs. We derive online softmax and tiling, verify a reference implementation to machine precision, and write a Triton kernel."
+author: "Maitreya"
+date: today
+categories: [llm-inference, flash-attention, triton, gpu]
+draft: false  # published early for pipeline testing; [MEASURE] placeholders still pending a real Colab run
+freeze: true  # cache executed output; Actions renders without re-running code (no GPU there)
+format:
+  html:
+    code-fold: false
+    toc: true
+---
+
+> **TL;DR** — Standard attention is slow not because of FLOPs but because it round-trips an $N\times N$ score matrix through GPU main memory. FlashAttention computes the *exact* same output while never materializing that matrix, by (1) an **online softmax** that turns softmax into a streamable, associative update, and (2) **tiling** the computation so each block of work lives entirely in on-chip SRAM. We derive both from scratch, verify a pure-PyTorch tiled implementation to machine precision, write a working Triton kernel, and benchmark memory and speed against naive attention and PyTorch SDPA. Result: same numbers out, `[MEASURE]`× faster, and sequence lengths that used to OOM now fit.
+
+## 1. The crime scene: where attention's time actually goes
+
+Attention for one head, $Q,K,V \in \mathbb{R}^{N\times d}$:
+
+$$S = \frac{QK^\top}{\sqrt d} \in \mathbb{R}^{N\times N}, \qquad P = \mathrm{softmax}(S), \qquad O = PV \in \mathbb{R}^{N\times d}.$$
+
+FLOPs: $O(N^2 d)$ — fine, GPUs eat matmuls for breakfast. The problem is *where the bytes live*. A GPU has two very different memories:
+
+| | Capacity | Bandwidth | Analogy |
+|---|---|---|---|
+| **HBM** (DRAM, "GPU memory") | 16–80 GB | ~0.3 TB/s (T4) … ~3.35 TB/s (H100) | warehouse across the street |
+| **SRAM** (shared mem/L1, per SM) | ~64–228 **KB** per SM | ~an order of magnitude+ faster, on-chip | your desk |
+
+Every kernel launch reads inputs from HBM and writes outputs back. Count the HBM traffic of the standard three-kernel implementation:
+
+1. matmul $S = QK^\top$: read $Q,K$ ($2Nd$), **write $S$ ($N^2$)**
+2. softmax: **read $S$ ($N^2$), write $P$ ($N^2$)**
+3. matmul $O = PV$: **read $P$ ($N^2$)**, read $V$, write $O$
+
+Total: $\Theta(Nd + N^2)$ HBM accesses, dominated by moving $S$ and $P$ around. At $N{=}8192$, fp16, that intermediate is $8192^2 \times 2\,\text{B} = 128\,\text{MB}$ *per head per batch element* — written, read, written, read. Meanwhile the useful output $O$ is 2 MB. The **arithmetic intensity** (FLOPs per byte of HBM traffic) collapses, and the GPU spends its life waiting on the warehouse. This is a textbook *memory-bound* kernel — the roofline model says so before you ever profile it.
+
+The fix has a name from the systems world: **kernel fusion + tiling**. Do all three steps inside SRAM, block by block, and never write $S$ or $P$ to HBM at all. One obstacle stands in the way: softmax normalizes over an *entire row*, but a tile only sees a *piece* of the row. Enter the key mathematical idea.
+
+## 2. Idea 1 — online softmax
+
+Numerically safe softmax over a row $s = (s_1,\dots,s_N)$ is a three-pass algorithm:
+
+$$m = \max_j s_j, \qquad \ell = \sum_j e^{s_j - m}, \qquad p_j = \frac{e^{s_j - m}}{\ell}.$$
+
+Three passes = three reads of the row. Milakov & Gimelshein (2018) showed the first two passes fuse into one: sweep the row once, maintaining a running max $m$ and a running denominator $\ell$, **retroactively rescaling** $\ell$ whenever the max improves. Process the row in chunks; for a new chunk $s^{(b)}$:
+
+$$m_{\text{new}} = \max\!\big(m_{\text{old}},\ \max_j s^{(b)}_j\big)$$
+$$\ell_{\text{new}} = \underbrace{e^{\,m_{\text{old}} - m_{\text{new}}}}_{\alpha,\ \text{rescale old}}\,\ell_{\text{old}} \;+\; \sum_j e^{\,s^{(b)}_j - m_{\text{new}}}$$
+
+Why is the rescale legal? Because $e^{s_j - m_{\text{new}}} = e^{s_j - m_{\text{old}}}\cdot e^{m_{\text{old}} - m_{\text{new}}}$ — every previously accumulated term is off by exactly the same factor $\alpha$, so multiply once and move on. The update is **associative**: merging per-chunk $(m,\ell)$ states gives the same answer in any grouping. That's the property that makes tiling (and, later, splitting rows across thread blocks) possible.
+
+FlashAttention's addition: carry the **output accumulator through the same trick**. We want $o = \sum_j p_j v_j$. Keep an *unnormalized* accumulator $\mathrm{acc} = \sum_j e^{s_j - m}\, v_j$ alongside $(m, \ell)$:
+
+$$\mathrm{acc}_{\text{new}} = \alpha\,\mathrm{acc}_{\text{old}} + \sum_{j \in b} e^{\,s^{(b)}_j - m_{\text{new}}}\, v_j, \qquad o = \frac{\mathrm{acc}}{\ell} \ \text{(divide once, at the very end)}.$$
+
+*(Historical footnote that shows you read the papers: FA1 kept `acc` normalized at every step — an extra multiply–divide per tile. FA2 defers the division to the end, exactly as above, trading non-matmul FLOPs for matmul FLOPs, which is one of the reasons it's ~2× faster.)*
+
+## 3. Idea 2 — tiling
+
+Now the algorithm writes itself. Cut $Q$ into row-blocks of $B_r$ and $K,V$ into column-blocks of $B_c$, sized so one $Q$-block, one $K$-block, one $V$-block, and the accumulators fit in SRAM together.
+
+**FlashAttention-2 forward (per Q-block $i$):**
+
+$$
+\begin{aligned}
+&m \leftarrow -\infty,\quad \ell \leftarrow 0,\quad \mathrm{acc} \leftarrow 0\\
+&\textbf{for } \text{each K/V block } j \text{ (skip fully-masked blocks if causal):}\\
+&\qquad S_{ij} = Q_i K_j^\top / \sqrt d \qquad\qquad\ \ \text{(in SRAM, } B_r\times B_c\text{)}\\
+&\qquad \text{apply causal mask to the tile's own future entries}\\
+&\qquad m' = \max(m,\ \mathrm{rowmax}(S_{ij})),\qquad P = e^{S_{ij} - m'},\qquad \alpha = e^{m - m'}\\
+&\qquad \ell \leftarrow \alpha\,\ell + \mathrm{rowsum}(P),\qquad \mathrm{acc} \leftarrow \alpha\,\mathrm{acc} + P\,V_j,\qquad m \leftarrow m'\\
+&O_i = \mathrm{acc}/\ell \quad\text{(one HBM write)};\qquad L_i = m + \log \ell \quad\text{(logsumexp, saved for backward)}
+\end{aligned}
+$$
+
+**Figure 1** (Mermaid — the state machine each Q-block runs):
+
+```{mermaid}
+flowchart LR
+    A["load Q_i → SRAM<br/>m=-∞, ℓ=0, acc=0"] --> B["load K_j, V_j → SRAM"]
+    B --> C["S = Q_i K_jᵀ/√d<br/>+ causal mask"]
+    C --> D["m' = max(m, rowmax S)<br/>P = exp(S−m'), α = exp(m−m')"]
+    D --> E["ℓ ← αℓ + rowsum P<br/>acc ← α·acc + P·V_j"]
+    E -->|next j| B
+    E -->|done| F["write O_i = acc/ℓ<br/>write L_i = m + log ℓ"]
+```
+
+**What never touches HBM:** $S$ and $P$. What does: $Q,K,V$ read (K and V once per Q-block), $O$ and the length-$N$ vector $L$ written once.
+
+## 4. The reference implementation (slow, exact, yours)
+
+Pure PyTorch, single head, deliberately un-vectorized across blocks — this is the *teaching* artifact. **I unit-tested this exact algorithm against dense softmax attention: max error ~1e-15 (float64), including causal masking and ragged block sizes.**
+
+```{python}
+#| eval: false
+import math, torch
+
+def flash_attention_reference(Q, K, V, block_q=64, block_k=64, causal=True):
+    """FlashAttention-2 forward in slow motion. Q,K,V: (N, d). Returns O, logsumexp."""
+    N, d = Q.shape
+    scale = 1.0 / math.sqrt(d)
+    O = torch.zeros_like(Q)
+    L = torch.zeros(N, device=Q.device, dtype=Q.dtype)
+    for qs in range(0, N, block_q):
+        qe = min(qs + block_q, N)
+        q   = Q[qs:qe]                                        # (Bq, d) "in SRAM"
+        m   = torch.full((qe - qs,), -float("inf"), device=Q.device)
+        l   = torch.zeros(qe - qs, device=Q.device)
+        acc = torch.zeros(qe - qs, d, device=Q.device)
+        k_end = qe if causal else N                           # causal: skip dead blocks
+        for ks in range(0, k_end, block_k):
+            ke = min(ks + block_k, k_end)
+            s = q @ K[ks:ke].T * scale                        # (Bq, Bk) tile
+            if causal:
+                qi = torch.arange(qs, qe, device=Q.device)[:, None]
+                kj = torch.arange(ks, ke, device=Q.device)[None, :]
+                s = s.masked_fill(kj > qi, -float("inf"))
+            m_new = torch.maximum(m, s.max(dim=-1).values)
+            p     = torch.exp(s - m_new[:, None])
+            alpha = torch.exp(m - m_new)                      # rescale factor
+            l     = alpha * l + p.sum(dim=-1)
+            acc   = acc * alpha[:, None] + p @ V[ks:ke]
+            m     = m_new
+        O[qs:qe] = acc / l[:, None]
+        L[qs:qe] = m + torch.log(l)
+    return O, L
+
+# --- exactness check ---
+torch.manual_seed(0)
+N, d = 512, 64
+Q, K, V = (torch.randn(N, d, dtype=torch.float64) for _ in range(3))
+S = (Q @ K.T / math.sqrt(d)).masked_fill(torch.triu(torch.ones(N, N, dtype=bool), 1), -float("inf"))
+O_exact = S.softmax(-1) @ V
+O_tiled, L = flash_attention_reference(Q, K, V)
+print("max|err| =", (O_exact - O_tiled).abs().max().item())   # ~1e-15
+```
+
+Three details worth a sentence each in the post: the **first iteration is self-initializing** ($\alpha = e^{-\infty - m'} = 0$ cleanly zeroes the empty state); **causality gives you compute for free** (whole K-blocks beyond the diagonal are skipped — that's the `k_end` line, and it's why causal FlashAttention is ~2× the speed of non-causal at the same $N$); and the returned $L$ is the entire memory footprint the backward pass needs — next section.
+
+## 5. IO complexity: the theorem behind the speedup
+
+With SRAM of size $M$, FlashAttention performs
+
+$$\Theta\!\left(\frac{N^2 d^2}{M}\right) \ \text{HBM accesses vs.}\ \Theta(Nd + N^2)\ \text{for standard attention.}$$
+
+Intuition for the bound: each pass over all of $K,V$ costs $\Theta(Nd)$ reads and serves the $B_r \approx M/d$ query rows currently resident in SRAM, so we make $N/B_r \approx Nd/M$ passes: $Nd \cdot Nd/M = N^2d^2/M$. Since $d^2 \ll M$ in practice ($d = 64\!-\!128 \Rightarrow d^2 \le 16\text{K}$ elements ≈ 32 KB fp16, vs $M \approx 100$ KB+), this is many times fewer bytes than $N^2$. Dao et al. also prove a matching lower bound — no exact-attention algorithm can beat this asymptotically for all SRAM sizes. Fewer bytes → the kernel climbs the roofline from memory-bound toward compute-bound → wall-clock speedup *with bit-for-bit-exact* math (well, exact up to float reassociation — see §9).
+
+**The version history in one table** (readers love this; it also shows you track the field):
+
+| | Core contribution | Effect |
+|---|---|---|
+| **FA1** (2022) | tiling + online softmax + recompute-in-backward | 2–4× over standard, memory $O(N)$ |
+| **FA2** (2023) | loop order inverted (parallelize over Q-blocks *and* sequence), deferred normalization, fewer non-matmul ops, better warp partitioning | ~2× over FA1, ~50–70% of peak matmul throughput |
+| **FA3** (2024) | Hopper-specific: warp specialization, TMA async copies, pingpong scheduling, FP8 support | ~1.5–2× over FA2 on H100, ~75% peak fp16 |
+
+## 6. The backward pass (why training also got cheaper)
+
+Standard attention backward needs $P$ ($N^2$, which we refused to store). FlashAttention **recomputes** each tile of $S$ and $P$ from $Q,K$ and the saved logsumexp $L$ during backward — $P_{ij} = e^{S_{ij} - L_i}$, no renormalization needed — trading cheap FLOPs for expensive bytes. The gradient algebra, given upstream $dO$:
+
+$$dV = P^\top dO, \qquad dP = dO\,V^\top, \qquad dS_{ij} = P_{ij}\,(dP_{ij} - D_i)\ \text{where } D_i = \textstyle\sum_j dO_{ij} O_{ij}, \qquad dQ = dS\,K/\sqrt d, \quad dK = dS^\top Q/\sqrt d.$$
+
+The $D_i$ trick is the softmax Jacobian collapsed to a row-dot-product — it lets the backward run tile-by-tile with the same online structure. Net effect: activation memory for attention drops from $O(N^2)$ to $O(N)$, which is *the* reason long-context training is feasible at all. (In the post, derive $dS$ from the softmax Jacobian in a short appendix; implement backward only if you want a Part 2.5 — the Triton tutorial has a reference.)
+
+## 7. A real kernel: FlashAttention forward in Triton
+
+Triton lets us write the actual fused kernel in Python-ish code and runs fine on a free T4 (it needs compute capability ≥ 7.0; T4 is 7.5). This is an *educational* kernel — fp16 in, fp32 accumulate, causal, no dropout, head_dim ≤ 128 — modeled on the official Triton fused-attention tutorial, which you should link as the production-grade version.
+
+```{python}
+#| eval: false
+import triton, triton.language as tl
+
+@triton.jit
+def _flash_fwd(Q, K, V, O, L, sm_scale,
+               stride_qbh, stride_qm, stride_qd,     # Q laid out (B*H, N, d)
+               stride_kbh, stride_kn, stride_kd,
+               stride_vbh, stride_vn, stride_vd,
+               stride_obh, stride_om, stride_od,
+               N_CTX,
+               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+               HEAD_DIM: tl.constexpr, CAUSAL: tl.constexpr):
+    start_m = tl.program_id(0)          # which Q-block
+    off_bh  = tl.program_id(1)          # which (batch, head)
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q_ptrs = Q + off_bh * stride_qbh + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+
+    hi = (start_m + 1) * BLOCK_M if CAUSAL else N_CTX
+    for start_n in range(0, hi, BLOCK_N):
+        kn = start_n + offs_n
+        k = tl.load(K + off_bh * stride_kbh + kn[:, None] * stride_kn + offs_d[None, :] * stride_kd,
+                    mask=kn[:, None] < N_CTX, other=0.0)
+        v = tl.load(V + off_bh * stride_vbh + kn[:, None] * stride_vn + offs_d[None, :] * stride_vd,
+                    mask=kn[:, None] < N_CTX, other=0.0)
+
+        s = tl.dot(q, tl.trans(k)) * sm_scale                       # (M, N) tile in registers
+        s = tl.where(kn[None, :] < N_CTX, s, float("-inf"))         # pad mask
+        if CAUSAL:
+            s = tl.where(offs_m[:, None] >= kn[None, :], s, float("-inf"))
+
+        m_ij  = tl.maximum(m_i, tl.max(s, 1))
+        p     = tl.exp(s - m_ij[:, None])
+        alpha = tl.exp(m_i - m_ij)
+        l_i   = l_i * alpha + tl.sum(p, 1)
+        acc   = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)
+        m_i   = m_ij
+
+    acc = acc / l_i[:, None]
+    o_ptrs = O + off_bh * stride_obh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+    tl.store(o_ptrs, acc.to(tl.float16), mask=offs_m[:, None] < N_CTX)
+    tl.store(L + off_bh * N_CTX + offs_m, m_i + tl.log(l_i), mask=offs_m < N_CTX)
+
+def flash_attn_triton(q, k, v, causal=True, BLOCK_M=64, BLOCK_N=64):
+    """q,k,v: (B, H, N, d) fp16, d in {16,32,64,128}."""
+    B, H, N, d = q.shape
+    q, k, v = (t.reshape(B * H, N, d).contiguous() for t in (q, k, v))
+    o = torch.empty_like(q)
+    L = torch.empty(B * H, N, device=q.device, dtype=torch.float32)
+    grid = (triton.cdiv(N, BLOCK_M), B * H)
+    _flash_fwd[grid](q, k, v, o, L, 1.0 / math.sqrt(d),
+                     *q.stride(), *k.stride(), *v.stride(), *o.stride(),
+                     N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=d, CAUSAL=causal)
+    return o.reshape(B, H, N, d)
+```
+
+Validate against SDPA (`torch.nn.functional.scaled_dot_product_attention`) — expect max abs error ~1e-2 in fp16, ~0 in the fp32-accumulated sense; and against the §4 reference exactly. *(Caveat box for the post: rows that are entirely padding produce NaN inside the tile — masked out at the store, so harmless, but say so before readers "discover" it. Also note kernels aren't autograd-connected; forward-only here.)*
+
+## 8. Benchmark protocol (T4 and, if you have credits, L4/A100)
+
+Three contenders × sequence lengths $N \in \{512, 1k, 2k, 4k, 8k, 16k\}$, B=4, H=12, d=64, fp16, causal:
+
+```{python}
+#| eval: false
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+def naive_attention(q, k, v):
+    s = (q @ k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+    s = s.masked_fill(torch.triu(torch.ones(s.shape[-2:], dtype=bool, device=s.device), 1), -float("inf"))
+    return s.softmax(-1) @ v            # materializes (B,H,N,N) — the villain
+
+def bench(fn, *args, iters=20):
+    torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
+    for _ in range(3): fn(*args)
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    for _ in range(iters): fn(*args)
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3, torch.cuda.max_memory_allocated() / 2**20
+```
+
+Report a table + two log-log plots (ms vs N, peak-MB vs N):
+
+| N | naive ms / MB | SDPA ms / MB | Triton ms / MB |
+|---|---|---|---|
+| 512 … 16384 | `[MEASURE]` (expect OOM by ~8–16k on T4) | `[MEASURE]` | `[MEASURE]` |
+
+**Expected story to verify:** naive memory grows quadratically and OOMs first; SDPA and the Triton kernel stay linear in $N$ and pull ahead in time as $N$ grows. **Hardware footnote (readers will hit this):** on a T4 (Turing, sm_75), PyTorch's *flash* SDPA backend and the official `flash-attn` wheel are unavailable — they require Ampere (sm_80)+; SDPA silently uses its *memory-efficient* backend instead (same $O(N)$ memory idea, xFormers lineage). On an L4/A100, force and compare backends explicitly:
+
+```{python}
+#| eval: false
+with sdpa_kernel(SDPBackend.FLASH_ATTENTION):   out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION): ...
+with sdpa_kernel(SDPBackend.MATH): ...          # the naive one, for reference
+```
+
+## 9. Fine print worth knowing
+
+- **"Exact" means exact-up-to-reassociation.** Floating-point addition isn't associative; tiling changes summation order, so outputs differ from naive attention at the ~1e-3 (fp16) level. Not an approximation error — a rounding-order difference. Batch-invariance/determinism debates in inference stem from exactly this class of effect.
+- **What tiling makes hard:** anything that needs the full realized score matrix — arbitrary dense attention *biases*, reading attention maps for interpretability, exotic masks. This pain point is why PyTorch shipped **FlexAttention** (2.5+): you write `score_mod`/`mask_mod` functions in Python and it compiles them *into* a fused flash-style kernel — sliding windows, ALiBi, document masking without writing Triton. Natural next post (menu item A8).
+- **Decode is a different beast.** At $q_{len}=1$ there's no $N\times N$ matrix to avoid; the bottleneck is streaming the KV cache (Part 1's table). Flash-style kernels there focus on parallelizing *across the KV length* (Flash-Decoding / split-KV). One paragraph + link is enough.
+
+## 10. What's next
+
+We can now run attention over long contexts without renting an A100 — for *one* sequence. Production serving is about hundreds of concurrent sequences with different lengths sharing one GPU. **Part 3** builds a miniature serving engine: iteration-level scheduling, and paging the Part-1 cache like an operating system.
+
+## References
+
+- Dao et al., *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*, 2022, arXiv:2205.14135.
+- Dao, *FlashAttention-2*, 2023, arXiv:2307.08691.
+- Shah, Bikshandi, Zhang, Thakkar, Ramani, Dao, *FlashAttention-3*, 2024, arXiv:2407.08608.
+- Milakov & Gimelshein, *Online normalizer calculation for softmax*, 2018, arXiv:1805.02867.
+- Rabe & Staats, *Self-attention Does Not Need O(n²) Memory*, 2021, arXiv:2112.05682 (the memory-efficient lineage SDPA uses on your T4).
+- Triton *Fused Attention* tutorial (triton-lang.org) — the production-grade version of §7, forward + backward.
+- PyTorch blog, *FlexAttention* (2024).
+- Aleksa Gordić, *ELI5: FlashAttention* (blog) — good complementary intuition; your differentiator is the tested reference implementation + measured roofline story.

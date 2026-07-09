@@ -1,0 +1,367 @@
+---
+title: "The KV Cache: Build It, Measure It, Understand Why LLMs Need It"
+description: "Autoregressive decoding recomputes what it already knows. We build a KV cache from scratch on GPT-2, prove it's exact, and measure the speedup."
+author: "Maitreya"
+date: today
+categories: [llm-inference, kv-cache, pytorch, gpt-2]
+draft: false  # published early for pipeline testing; [MEASURE] placeholders still pending a real Colab run
+freeze: true  # cache executed output; Actions renders without re-running code (no GPU there)
+format:
+  html:
+    code-fold: false
+    toc: true
+---
+
+> **TL;DR** — Autoregressive generation re-runs the transformer over the *entire* prefix for every new token. But causal attention has a special structure: past tokens never look at future tokens, so their keys and values never change. Cache them, and each step only processes **one token** instead of the whole sequence. We build this from scratch on GPT-2, verify it's mathematically exact, measure a **[MEASURE — expect ~5–20×]** wall-clock speedup on a free Colab T4, and then confront the price: the cache itself becomes the memory bottleneck that the rest of this series is about.
+
+## 1. The problem: generation is a loop that forgets it's a loop
+
+A decoder-only LLM generates text one token at a time. The naive loop looks like this:
+
+```{python}
+#| eval: false
+tokens = prompt
+for _ in range(max_new_tokens):
+    logits = model(tokens)            # forward over the WHOLE sequence
+    tokens = tokens + [sample(logits[-1])]
+```
+
+Look at what happens across steps. At step 1 we run the model over `t` tokens. At step 2, over `t+1` tokens — of which `t` are *identical to what we just processed*. By step 500 we've pushed the first prompt token through the network 500 times, and gotten the exact same intermediate results 500 times.
+
+How expensive is this? For a model with hidden size $d$ generating up to length $n$, one forward pass over $t$ tokens costs roughly $O(t \cdot d^2)$ for the linear layers (QKV projections + MLP) and $O(t^2 \cdot d)$ for attention. Summed over the generation loop:
+
+$$\underbrace{\sum_{t=1}^{n} O(t d^2)}_{\text{linear layers}} + \underbrace{\sum_{t=1}^{n} O(t^2 d)}_{\text{attention}} \;=\; O(n^2 d^2) + O(n^3 d).$$
+
+Two things to notice, because most explanations get the emphasis wrong:
+
+- The attention term is *cubic* in sequence length. That's the headline.
+- But for realistic lengths ($n$ in the hundreds–thousands, $d$ in the thousands, so $n \lesssim d$), the **linear-layer term $O(n^2d^2)$ dominates the actual FLOP count**. The biggest practical waste isn't recomputing attention — it's re-running every MLP over the whole prefix, every step.
+
+The KV cache eliminates both.
+
+## 2. What decode actually needs: the math
+
+Causal self-attention for token $t$ (single head, pre-softmax scale $1/\sqrt{d_h}$):
+
+$$o_t = \sum_{j \le t} \mathrm{softmax}_j\!\left(\frac{q_t^\top k_j}{\sqrt{d_h}}\right) v_j
+= \mathrm{softmax}\!\left(\frac{q_t K_{1:t}^\top}{\sqrt{d_h}}\right) V_{1:t}.$$
+
+Read the dependencies off this formula:
+
+1. $o_t$ needs **$q_t$** — the query of the *current* token only.
+2. $o_t$ needs **$K_{1:t}, V_{1:t}$** — keys and values of *all* tokens so far.
+3. Because the mask is causal, $k_j$ and $v_j$ for $j < t$ were computed from a prefix that hasn't changed. **They are constants.** Recomputing them is pure waste.
+
+So the algorithm rewrites itself:
+
+> Keep $K_{1:t-1}, V_{1:t-1}$ in memory. At each step, run the network on **one token**: compute $q_t, k_t, v_t$ from $x_t$, append $k_t, v_t$ to the cache, attend $q_t$ against the full cache.
+
+Per-step cost drops from $O(td^2 + t^2d)$ to $O(d^2 + td)$; the totals become
+
+$$O(n^2 d^2) + O(n^3 d) \;\longrightarrow\; O(n d^2) + O(n^2 d).$$
+
+**Why not cache Q too?** Symmetry suggests it, but look at dependency (1): past queries $q_{j<t}$ appear *nowhere* in any future step. A query exists to compute its own row of attention — once that row is done, the query is dead. Causality means new tokens query the past; the past never queries the future. (In an encoder, where everyone attends to everyone and the sequence doesn't grow, none of this machinery applies — caching is a *decoding* trick.)
+
+**Figure 1** (Mermaid source — render or screenshot):
+
+```{mermaid}
+flowchart LR
+    subgraph step["decode step t"]
+        x["x_t (1 token)"] --> qkv["W_qkv"]
+        qkv --> q["q_t"]
+        qkv --> k["k_t"]
+        qkv --> v["v_t"]
+    end
+    k -->|append| K[("K cache 1..t")]
+    v -->|append| V[("V cache 1..t")]
+    q --> att["attention: softmax(q_t·Kᵀ)·V"]
+    K --> att
+    V --> att
+    att --> out["o_t → MLP → logits"]
+```
+
+## 3. Build it: a minimal GPT-2 with a cache
+
+We'll write a ~120-line GPT-2 that loads the real pretrained weights from Hugging Face, with a `forward` that optionally consumes and returns per-layer caches. (Architecture and weight-porting follow the well-known nanoGPT pattern.) Everything below is one Colab notebook; cells are marked.
+
+**Cell 1 — setup**
+
+```{python}
+#| eval: false
+# GPU: Runtime → Change runtime type → T4
+!pip -q install tiktoken transformers
+import math, time, torch, torch.nn as nn, torch.nn.functional as F
+from dataclasses import dataclass
+torch.manual_seed(0)
+device = "cuda"
+print(torch.__version__, torch.cuda.get_device_name())
+```
+
+**Cell 2 — the model**
+
+```{python}
+#| eval: false
+@dataclass
+class GPTConfig:
+    block_size: int = 1024   # GPT-2 max context
+    vocab_size: int = 50257
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_head = cfg.n_head
+        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)  # fused QKV
+        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
+
+    def forward(self, x, cache=None):
+        B, T, C = x.shape
+        q, k, v = self.c_attn(x).split(C, dim=2)
+        # (B, T, C) -> (B, n_head, T, head_dim)
+        q, k, v = (t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+                   for t in (q, k, v))
+        if cache is not None:                    # decode: extend the cache
+            k_past, v_past = cache
+            k = torch.cat([k_past, k], dim=2)
+            v = torch.cat([v_past, v], dim=2)
+        # Masking subtlety, explained in §6:
+        #   no cache  -> square attention -> causal mask ON
+        #   cache     -> 1 query vs t keys -> the "mask" is the cache boundary itself
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=(cache is None))
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y), (k, v)
+
+class MLP(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.c_fc   = nn.Linear(cfg.n_embd, 4 * cfg.n_embd)
+        self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd)
+        self.act    = nn.GELU(approximate="tanh")   # GPT-2 uses tanh-GELU
+    def forward(self, x):
+        return self.c_proj(self.act(self.c_fc(x)))
+
+class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.ln_1, self.attn = nn.LayerNorm(cfg.n_embd), CausalSelfAttention(cfg)
+        self.ln_2, self.mlp  = nn.LayerNorm(cfg.n_embd), MLP(cfg)
+    def forward(self, x, cache=None):
+        a, cache = self.attn(self.ln_1(x), cache)
+        x = x + a
+        x = x + self.mlp(self.ln_2(x))
+        return x, cache
+
+class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.config = cfg
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(cfg.vocab_size, cfg.n_embd),
+            wpe = nn.Embedding(cfg.block_size, cfg.n_embd),
+            h   = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer)),
+            ln_f= nn.LayerNorm(cfg.n_embd),
+        ))
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.transformer.wte.weight   # weight tying
+
+    def forward(self, idx, caches=None):
+        B, T = idx.shape
+        past = 0 if caches is None else caches[0][0].size(2)
+        assert past + T <= self.config.block_size
+        # POSITION OFFSET: token t must get position embedding t, not 0 (§6)
+        pos = torch.arange(past, past + T, device=idx.device)
+        x = self.transformer.wte(idx) + self.transformer.wpe(pos)
+        new_caches = []
+        for i, block in enumerate(self.transformer.h):
+            x, c = block(x, None if caches is None else caches[i])
+            new_caches.append(c)
+        x = self.transformer.ln_f(x)
+        return self.lm_head(x), new_caches
+
+    @classmethod
+    def from_pretrained(cls):
+        """Load HF GPT-2 (124M) weights into this implementation."""
+        from transformers import GPT2LMHeadModel
+        model, sd = cls(GPTConfig()), None
+        sd = model.state_dict()
+        hf = GPT2LMHeadModel.from_pretrained("gpt2").state_dict()
+        # HF stores linear layers as Conv1D -> weights are transposed
+        transposed = ("attn.c_attn.weight", "attn.c_proj.weight",
+                      "mlp.c_fc.weight", "mlp.c_proj.weight")
+        with torch.no_grad():
+            for k in hf:
+                if k.endswith(".attn.masked_bias") or k.endswith(".attn.bias"):
+                    continue                      # causal-mask buffers, not params
+                w = hf[k].t() if any(k.endswith(t) for t in transposed) else hf[k]
+                sd[k].copy_(w)
+        return model
+
+model = GPT.from_pretrained().to(device).eval()
+print(sum(p.numel() for p in model.parameters())/1e6, "M params")
+```
+
+**Cell 3 — two generation loops**
+
+```{python}
+#| eval: false
+def timed(fn):
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    out = fn()
+    torch.cuda.synchronize()
+    return out, time.perf_counter() - t0
+
+@torch.no_grad()
+def generate_no_cache(model, idx, max_new_tokens):
+    """The naive loop: full forward over the whole sequence, every step."""
+    per_step = []
+    for _ in range(max_new_tokens):
+        (logits, _), dt = timed(lambda: model(idx[:, -model.config.block_size:]))
+        idx = torch.cat([idx, logits[:, -1].argmax(-1, keepdim=True)], dim=1)
+        per_step.append(dt)
+    return idx, per_step
+
+@torch.no_grad()
+def generate_with_cache(model, idx, max_new_tokens):
+    """Prefill once over the prompt, then feed ONE token per step."""
+    per_step = []
+    (logits, caches), t_prefill = timed(lambda: model(idx))       # PREFILL
+    nxt = logits[:, -1].argmax(-1, keepdim=True)
+    out = [idx, nxt]
+    for _ in range(max_new_tokens - 1):                            # DECODE
+        (logits, caches), dt = timed(lambda: model(nxt, caches))
+        nxt = logits[:, -1].argmax(-1, keepdim=True)
+        out.append(nxt)
+        per_step.append(dt)
+    return torch.cat(out, dim=1), per_step, t_prefill
+```
+
+## 4. Correctness first: the cache must be *exact*
+
+The KV cache is not an approximation. Greedy decoding with and without it must produce **identical tokens** — this is the unit test that catches every masking/position bug:
+
+```{python}
+#| eval: false
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+prompt = torch.tensor([enc.encode("The key to fast inference is")], device=device)
+
+model_fp32 = model.float()   # do the equality check in fp32 (see note)
+a, _     = generate_no_cache(model_fp32, prompt.clone(), 100)
+b, _, _  = generate_with_cache(model_fp32, prompt.clone(), 100)
+assert torch.equal(a, b), "cache changed the output!"
+print("exactness ✓ :", enc.decode(a[0].tolist())[:120], "...")
+```
+
+> **Note:** run the *check* in fp32. In fp16/bf16 the cached and uncached paths hit different kernels, whose results differ by float-rounding noise; after a soft argmax tie that can flip a token. Same math, different rounding — worth a sentence in the post because readers will hit it.
+
+## 5. Measure it: benchmarks on a free T4
+
+**Cell 4 — the race**
+
+```{python}
+#| eval: false
+model = model.half()   # fp16 for realistic speed
+prompt = torch.randint(0, 50257, (1, 128), device=device)
+
+for warmup in range(3):
+    generate_with_cache(model, prompt, 16)
+
+_, steps_nc      = generate_no_cache(model, prompt.clone(), 400)
+_, steps_c, tp   = generate_with_cache(model, prompt.clone(), 400)
+print(f"no cache : {sum(steps_nc):6.2f}s total, last-step latency {steps_nc[-1]*1e3:6.1f} ms")
+print(f"cache    : {sum(steps_c)+tp:6.2f}s total, per-step latency  {1e3*sum(steps_c)/len(steps_c):6.1f} ms (prefill {tp*1e3:.0f} ms)")
+```
+
+**Cell 5 — the money plot**
+
+```{python}
+#| eval: false
+import matplotlib.pyplot as plt
+fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+ax[0].plot([t*1e3 for t in steps_nc], label="no cache")
+ax[0].plot([t*1e3 for t in steps_c],  label="KV cache")
+ax[0].set(xlabel="decode step", ylabel="latency (ms)", title="Per-token latency")
+ax[0].legend()
+import numpy as np
+ax[1].plot(np.cumsum(steps_nc), label="no cache")
+ax[1].plot(np.cumsum(steps_c),  label="KV cache")
+ax[1].set(xlabel="decode step", ylabel="cumulative time (s)", title="Total generation time")
+ax[1].legend(); plt.tight_layout(); plt.savefig("figures/latency.png", dpi=180)
+```
+
+**What you should see** (fill with your run — GPT-2 124M, fp16, T4):
+
+| Metric (prompt 128, generate 400) | No cache | KV cache |
+|---|---|---|
+| Total time | `[MEASURE]` s | `[MEASURE]` s |
+| Speedup | — | **`[MEASURE]` — expect ~5–20×** |
+| Per-token latency vs step | grows ~linearly (cost ∝ current length) | ~flat |
+| Peak extra memory | ~0 | = cache size, computed below |
+
+The *shape* of the left plot is the pedagogical payload: without the cache, per-token latency is a rising line (each step reprocesses a longer prefix); with it, a flat one. Also worth reporting: rerun with `prompt_len ∈ {16, 512}` — the speedup grows with prompt length, exactly as the $O(n^2d^2) \to O(nd^2)$ analysis predicts.
+
+## 6. The three bugs everyone writes (I wrote two of them)
+
+**Positions.** With a cache, step $t$ feeds the model a tensor of shape `(B, 1)`. If you compute positions as `arange(T)` you'll embed every generated token at position 0. GPT-2's learned absolute embeddings make this catastrophic *and* silent — the model produces fluent garbage. Fix: offset by the cache length (see `forward`). RoPE models have the same bug in rotary phase form.
+
+**Masking.** During prefill (square $T\times T$ attention) you need the causal mask. During cached decode, the query attends to *every* cache entry — a causal mask is unnecessary, and PyTorch's `is_causal=True` is actually *wrong* here: with $q_{len}=1 \ne k_{len}=t$, SDPA aligns the mask's diagonal top-left and would mask out almost the entire cache. Hence `is_causal=(cache is None)`. This asymmetry ("mask when square, don't when decoding") confuses everyone once.
+
+**Batching + padding.** With batched prompts of different lengths you must left-pad (so last positions align) and carry an explicit padding mask into the attention — cached decode has no mask to hide behind. We dodge this with batch=1 here; Part 3 solves it properly with per-sequence lengths.
+
+## 7. The bill: the cache is memory you now have to plan for
+
+Per token, per sequence, the cache stores one K and one V vector per layer per KV-head:
+
+$$\text{bytes/token} = 2 \times n_{\text{layers}} \times n_{\text{kv-heads}} \times d_{\text{head}} \times \text{bytes}_{\text{dtype}}$$
+
+```{python}
+#| eval: false
+def kv_bytes_per_token(n_layer, n_kv_heads, d_head, bytes_per=2):
+    return 2 * n_layer * n_kv_heads * d_head * bytes_per
+```
+
+| Model | Layers | KV heads × d_head | KB / token (fp16) | 8k context | 128k context |
+|---|---|---|---|---|---|
+| GPT-2 124M | 12 | 12×64 (MHA) | 36 | 0.29 GB | — (ctx 1k) |
+| Llama-2-7B | 32 | 32×128 (MHA) | 512 | 4.0 GB | — |
+| Llama-3-8B | 32 | 8×128 (GQA) | 128 | 1.0 GB | **16 GB** |
+| Llama-3-70B | 80 | 8×128 (GQA) | 320 | 2.6 GB | **40 GB** |
+
+*(Per sequence. Multiply by batch size. Sanity-check on our toy: 36 KB × 1024 ctx ≈ 37 MB — verify against `torch.cuda.memory_allocated()` before/after prefill in the notebook.)*
+
+Stare at the Llama-3-8B row: at 128k context, **the cache (16 GB) matches the fp16 weights (16 GB)**. This single table explains half of modern inference research:
+
+- **MQA / GQA** (1 or few KV heads shared across query heads): shrink $n_{\text{kv-heads}}$ — that's the 4× gap between the Llama-2 and Llama-3 rows.
+- **MLA** (DeepSeek): don't store K,V at all; store a small latent (in DeepSeek-V2, ~576 numbers per layer per token vs 32,768 for its MHA equivalent — a ~57× cut) and reconstruct on the fly.
+- **Quantized / windowed caches**: fp8/int4 cache, sliding-window attention (Mistral) keeps only the last $w$ tokens.
+- **PagedAttention** (vLLM): stop allocating the cache contiguously; page it like an OS pages RAM — Part 3.
+
+## 8. Prefill vs decode: one model, two workloads
+
+The cache splits inference into phases with opposite hardware personalities, and this asymmetry drives *everything* in Parts 2–3:
+
+| | **Prefill** (prompt) | **Decode** (per token) |
+|---|---|---|
+| Shape | big matmuls over $T$ tokens | matrix–vector, 1 token |
+| Bound by | **compute** (FLOPs) | **memory bandwidth** (streaming weights + cache) |
+| Batch size helps? | little (already saturated) | massively (amortize the streaming) |
+| Latency metric | TTFT (time to first token) | TPOT / inter-token latency |
+
+A decode step must read every weight and the whole cache from GPU DRAM to produce *one* token — arithmetic intensity near 1 FLOP/byte, while a T4 needs ~200 to stay busy. The GPU idles on memory. Part 2 (FlashAttention) attacks the memory traffic of attention itself; Part 3 (continuous batching) fills the idle compute with other users' tokens.
+
+## 9. What's next
+
+You now have a model that generates efficiently for *one* sequence — and a cache whose size you can predict to the byte. **Part 2** opens up the attention kernel itself: why materializing the $T\times T$ score matrix is the real crime, and how FlashAttention computes exact softmax attention without ever writing it to memory. Same repo, same MiniGPT.
+
+## References & further reading
+
+- Vaswani et al., *Attention Is All You Need*, 2017 — the $O(n^2)$ we're taming.
+- Shazeer, *Fast Transformer Decoding: One Write-Head Is All You Need* (MQA), 2019, arXiv:1911.02150.
+- Ainslie et al., *GQA: Training Generalized Multi-Query Transformer Models*, 2023, arXiv:2305.13245.
+- DeepSeek-AI, *DeepSeek-V2* (introduces MLA), 2024, arXiv:2405.04434.
+- Kwon et al., *Efficient Memory Management for LLM Serving with PagedAttention*, SOSP 2023, arXiv:2309.06180.
+- kipply, *Transformer Inference Arithmetic* (blog, 2022) — the classic back-of-envelope treatment.
+- Karpathy, *nanoGPT* — the architecture/weight-loading pattern used here.
+- Hugging Face docs: *KV cache strategies* — how production libraries expose all this.
