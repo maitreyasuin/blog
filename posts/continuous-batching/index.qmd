@@ -4,7 +4,7 @@ description: "A decode step is memory-bound, so serving one user wastes the GPU.
 author: "Maitreya"
 date: today
 categories: [llm-inference, serving, vllm, pagedattention]
-draft: false  # published early for pipeline testing; [MEASURE] placeholders still pending a real Colab run
+draft: true  # flip to false once [MEASURE] placeholders are filled in from a real Colab run
 freeze: true  # cache executed output; Actions renders without re-running code (no GPU there)
 format:
   html:

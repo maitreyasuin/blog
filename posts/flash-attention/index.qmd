@@ -4,7 +4,7 @@ description: "Standard attention is slow because of memory traffic, not FLOPs. W
 author: "Maitreya"
 date: today
 categories: [llm-inference, flash-attention, triton, gpu]
-draft: false  # published early for pipeline testing; [MEASURE] placeholders still pending a real Colab run
+draft: true  # flip to false once [MEASURE] placeholders are filled in from a real Colab run
 freeze: true  # cache executed output; Actions renders without re-running code (no GPU there)
 format:
   html:
