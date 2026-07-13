@@ -4,7 +4,7 @@ project:
 website:
   description: "A blog built with Quarto"
   site-url: https://maitreyasuin.github.io/blog
-  title: "My Blog"
+  title: "Maitreya - Notes"
   navbar:
     right:
       - about.qmd

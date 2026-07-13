@@ -1,5 +1,5 @@
 ---
-title: "My Blog"
+title: "Maitreya - Notes"
 listing:
   contents: posts
   feed: true
