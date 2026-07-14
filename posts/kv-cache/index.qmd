@@ -388,7 +388,7 @@ The mechanism: for non-square shapes, SDPA aligns the causal mask to the **top-l
 
 ### Bug 3 - batching + padding: deferred, deliberately
 
-With batched prompts of different lengths you must left-pad (so every sequence's *last* token lands in the same column - that's the position whose logits you sample) and carry an explicit padding mask, because cached decode has no causal mask to hide behind and will happily attend to padding K/V as if they were content. Right-padding breaks in two places at once: the logits you gather at `[:, -1]` belong to padding, and the position offsets go wrong per-sequence. We dodge all of this with batch = 1 here.
+For this simple generation loop, left-padding is the easiest correct choice, because `logits[:, -1]` then corresponds to the last real token for every sequence. Right-padding can also be made correct, but then you must gather each sequence’s last non-padding logits, maintain per-sequence position offsets, and ensure padding K/V entries are masked out. We dodge all of this with batch = 1 here.
 
 ## 6. Measure it: benchmarks on a free T4
 
@@ -424,6 +424,8 @@ for r in rows: print(r)
 
 Expect the speedup to *grow* with prompt length - exactly what the $O(n^2d^2) \to O(nd^2)$ analysis predicts.
 
+*Note that Colab timings are noisy, so better to take median over multiple runs than to trust a single run*.
+
 **Cell 7 - the money plot** (note the cached cumulative curve includes the prefill, so both curves are honest end-to-end time):
 
 ```{python}
@@ -453,12 +455,12 @@ $$\text{bytes/token} = 2 \times n_{\text{layers}} \times n_{\text{kv-heads}} \ti
 |---|---|---|---|---|---|
 | GPT-2 124M | 12 | 12×64 (MHA) | 36 | 0.29 GiB | - (ctx 1k) |
 | Llama-2-7B | 32 | 32×128 (MHA) | 512 | 4.0 GiB | - |
-| Llama-3-8B | 32 | 8×128 (GQA) | 128 | 1.0 GiB | **16 GiB** |
-| Llama-3-70B | 80 | 8×128 (GQA) | 320 | 2.5 GiB | **40 GiB** |
+| Llama-3.1-8B | 32 | 8×128 (GQA) | 128 | 1.0 GiB | **16 GiB** |
+| Llama-3.1-70B | 80 | 8×128 (GQA) | 320 | 2.5 GiB | **40 GiB** |
 
-*The cache is not a model property; it's a **model × sequence length × batch size** property. At batch 32, the Llama-3-8B 128k row becomes $32 \times 16 = 512$ GiB, before weights, activations, or allocator overhead.*
+*The cache is not a model property; it's a **model × sequence length × batch size** property. At batch 32, the Llama-3.1-8B 128k row becomes $32 \times 16 = 512$ GiB, before weights, activations, or allocator overhead.*
 
-There are a few ways to address this, such as **MQA / GQA** (1 or few KV heads shared across query heads), **MLA** (DeepSeek, don't store K,V at all; store a small latent), **quantized / windowed caches**, and **PagedAttention** (vLLM). We will cover some of these in future parts of this series.
+There are a few ways to address this, such as **MQA / GQA** (1 or few KV heads shared across query heads), **MLA** (DeepSeek, store a small latent), **quantized / windowed caches**, and **PagedAttention** (vLLM). We will cover some of these in future parts of this series.
 
 ## 8. The uncomfortable truth: our cache is correct, and still bad
 
