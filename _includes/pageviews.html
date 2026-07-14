@@ -7,10 +7,12 @@
   el.textContent = '… views';
   meta.appendChild(el);
   var path = location.pathname;
+  // GoatCounter returns 404 (with a valid zero-count JSON body) for paths
+  // that haven't recorded a hit yet - that's a legitimate "0 views", not a
+  // failure, so don't gate on r.ok here.
   fetch('https://maitreya.goatcounter.com/counter/' + encodeURIComponent(path) + '.json')
-    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (r) { return r.json(); })
     .then(function (data) {
-      if (!data) { el.remove(); return; }
       var n = parseInt(data.count, 10) || 0;
       el.textContent = n.toLocaleString() + (n === 1 ? ' view' : ' views');
     })
