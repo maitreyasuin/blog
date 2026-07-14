@@ -72,6 +72,22 @@ body.quarto-light .quarto-title-banner {
   background-color: #375a7f;
 }
 
+/* Per-page GoatCounter view count, injected into the title metadata block
+   (see _includes/pageviews.html) */
+.page-views {
+  font-size: 0.85em;
+  opacity: 0.7;
+}
+
+/* Sitewide total view count on the homepage (see index.qmd + _includes/total-views.html) */
+.site-total-views {
+  text-align: center;
+  font-size: 0.9rem;
+  opacity: 0.7;
+  margin-top: -0.5em;
+  margin-bottom: 1.5em;
+}
+
 /* "depth" listing field, shown as a small badge (see fundamentals/llm-systems/generative/agentic.qmd) */
 .listing-depth {
   display: inline-block;

@@ -24,6 +24,25 @@ jobs:
       - name: Set up Quarto
         uses: quarto-dev/quarto-actions/setup@v2
 
+      - name: Fetch total pageview count from GoatCounter
+        env:
+          GOATCOUNTER_API_TOKEN: ${{ secrets.GOATCOUNTER_API_TOKEN }}
+        run: |
+          if [ -z "$GOATCOUNTER_API_TOKEN" ]; then
+            echo "GOATCOUNTER_API_TOKEN not set, skipping (total counter will stay hidden)"
+            exit 0
+          fi
+          total=$(curl -sf "https://maitreya.goatcounter.com/api/v0/stats/total?start=2020-01-01T00:00:00Z" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $GOATCOUNTER_API_TOKEN" \
+            | jq -r '.total // empty') || true
+          if [ -n "$total" ]; then
+            echo "window.__GC_TOTAL__ = $total;" > _includes/total-views.html
+            echo "Total pageviews: $total"
+          else
+            echo "Could not fetch total pageview count, leaving placeholder"
+          fi
+
       - name: Render site
         run: quarto render
 

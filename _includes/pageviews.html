@@ -1,0 +1,19 @@
+<script>
+(function () {
+  var meta = document.querySelector('.quarto-title-meta');
+  if (!meta) return;
+  var el = document.createElement('div');
+  el.className = 'page-views';
+  el.textContent = '… views';
+  meta.appendChild(el);
+  var path = location.pathname;
+  fetch('https://maitreya.goatcounter.com/counter/' + encodeURIComponent(path) + '.json')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (data) {
+      if (!data) { el.remove(); return; }
+      var n = parseInt(data.count, 10) || 0;
+      el.textContent = n.toLocaleString() + (n === 1 ? ' view' : ' views');
+    })
+    .catch(function () { el.remove(); });
+})();
+</script>
