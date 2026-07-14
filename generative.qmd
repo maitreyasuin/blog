@@ -1,5 +1,5 @@
 ---
-title: "Generative"
+title: "🎨 Generative"
 listing:
   contents: notes/generative
   type: default
@@ -14,4 +14,4 @@ page-layout: full
 title-block-banner: true
 ---
 
-Diffusion, GANs/VAEs, vision-language models, and world models — generating pixels, video, and more.
+Diffusion, GANs/VAEs, vision-language models, and world models - generating pixels, video, and more.

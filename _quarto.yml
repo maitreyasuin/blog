@@ -5,6 +5,7 @@ website:
   description: "A blog built with Quarto"
   site-url: https://maitreyasuin.github.io/blog
   title: "Maitreya - Notes"
+  favicon: favicon.svg
   navbar:
     left:
       - fundamentals.qmd

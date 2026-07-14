@@ -1,18 +1,19 @@
 ---
-title: "Maitreya - Notes"
+title: "Building ML Systems from First Principles"
+subtitle: "Deep dives into tensors, transformers, inference engines, and agents - with real code, math, and benchmarks, not hand-waving."
 page-layout: full
 title-block-banner: true
 ---
 
-::: {.grid}
+::: {.grid .home-cards}
 
-::: {.g-col-12 .g-col-md-6}
-### [Fundamentals](fundamentals.qmd)
+::: {.g-col-12 .g-col-md-6 .home-card}
+### 🧮 [Fundamentals](fundamentals.qmd)
 Tensors, classical ML, training, architectures, and vision - the building blocks everything else stands on.
 :::
 
-::: {.g-col-12 .g-col-md-6}
-### [LLM Systems](llm-systems.qmd)
+::: {.g-col-12 .g-col-md-6 .home-card}
+### ⚙️ [LLM Systems](llm-systems.qmd)
 Inference, post-training, and scaling - how LLMs actually run and get better in production.
 :::
 

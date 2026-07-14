@@ -1,5 +1,43 @@
 /* css styles */
 
+/* Sitewide typography: cosmo/darkly's default body copy reads a little small
+   and cramped for long-form posts, so bump size/line-height and give headings
+   more breathing room. main.content covers posts, listings, and plain pages;
+   the more specific .listing-title rule elsewhere still wins for card titles. */
+main.content {
+  font-size: 1.05rem;
+  line-height: 1.7;
+}
+main.content h2 {
+  margin-top: 1.8em;
+  margin-bottom: 0.6em;
+}
+main.content h3 {
+  margin-top: 1.4em;
+  margin-bottom: 0.5em;
+}
+
+/* Homepage section cards */
+.home-cards {
+  margin-top: 0.5em;
+}
+.home-card {
+  border: 1px solid var(--bs-border-color, #dee2e6);
+  border-radius: 0.6rem;
+  padding: 1.6em;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.home-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.12);
+}
+.home-card h3 {
+  margin-top: 0 !important;
+}
+.home-card h3 a {
+  text-decoration: none;
+}
+
 /* Light mode: reuse dark mode's blue top bar (navbar + title banner, both #375a7f
    in the darkly theme) instead of cosmo's default light-gray band. */
 body.quarto-light .navbar {
@@ -19,7 +57,8 @@ body.quarto-light .quarto-title-banner a,
 body.quarto-light .quarto-title-banner h1,
 body.quarto-light .quarto-title-banner .h1,
 body.quarto-light .quarto-title-banner h2,
-body.quarto-light .quarto-title-banner .h2 {
+body.quarto-light .quarto-title-banner .h2,
+body.quarto-light .quarto-title-banner .subtitle {
   color: #dee2e6;
 }
 body.quarto-light .quarto-title-banner {
