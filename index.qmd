@@ -33,7 +33,7 @@ Tensors, optimization, classical ML, training loops and architectures - the buil
 
 ::: {.g-col-12 .g-col-md-6 .home-card}
 ### ⚙️ [LLM Systems](llm-systems.qmd)
-Tensors, optimization, classical ML, training loops, architectures, and vision - the building blocks behind modern AI systems.
+Inference, serving, post-training, evaluation, and scaling — how modern LLMs are built, optimized, and deployed.
 :::
 
 :::
