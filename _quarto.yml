@@ -32,6 +32,7 @@ format:
     include-in-header:
       - _includes/google-site-verification.html
       - _includes/goatcounter.html
+      - _includes/private-view-toggle.html
     include-after-body: _includes/pageviews.html
 
 

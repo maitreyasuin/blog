@@ -1,5 +1,9 @@
 <script>
 (function () {
+  // Private: only visible in a browser that's been flagged via
+  // ?showviews=1 (see _includes/private-view-toggle.html). Public
+  // visitors never trigger this fetch.
+  if (localStorage.getItem('showViewCounts') !== '1') return;
   var meta = document.querySelector('.quarto-title-meta');
   if (!meta) return;
   var el = document.createElement('div');

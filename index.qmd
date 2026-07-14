@@ -17,6 +17,7 @@ listing:
 
 <script>
 (function () {
+  if (localStorage.getItem('showViewCounts') !== '1') return;
   var el = document.getElementById('site-total-views');
   if (!el || typeof window.__GC_TOTAL__ !== 'number') return;
   el.textContent = window.__GC_TOTAL__.toLocaleString() + ' total views across this site';

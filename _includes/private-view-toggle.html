@@ -1,0 +1,15 @@
+<script>
+// Visit any page with ?showviews=1 once to turn view counters on for you,
+// only in this browser (?showviews=0 turns them back off). Everyone else
+// never sees them and never triggers the counter fetch.
+(function () {
+  var params = new URLSearchParams(location.search);
+  if (params.has('showviews')) {
+    if (params.get('showviews') === '0') {
+      localStorage.removeItem('showViewCounts');
+    } else {
+      localStorage.setItem('showViewCounts', '1');
+    }
+  }
+})();
+</script>
