@@ -1,20 +1,26 @@
 ---
-title: "Building ML Systems from First Principles"
-subtitle: "Deep dives into tensors, transformers, inference engines, and agents - with real code, math, and benchmarks, not hand-waving."
+title: "Modern AI, Under the Hood"
+subtitle: "Deep technical notes on the modern AI stack — from model internals and generative modeling to inference systems, agents, and applied ML — with runnable code, math, benchmarks, and implementation details."
 page-layout: full
 title-block-banner: true
+listing:
+  id: all-posts
+  contents: notes
+  type: default
+  feed: true
+  sort: "date desc"
 ---
 
 ::: {.grid .home-cards}
 
 ::: {.g-col-12 .g-col-md-6 .home-card}
-### 🧮 [Fundamentals](fundamentals.qmd)
-Tensors, classical ML, training, architectures, and vision - the building blocks everything else stands on.
+### 🧮 [Foundations](fundamentals.qmd)
+Tensors, optimization, classical ML, training loops and architectures - the building blocks behind modern AI systems.
 :::
 
 ::: {.g-col-12 .g-col-md-6 .home-card}
 ### ⚙️ [LLM Systems](llm-systems.qmd)
-Inference, post-training, and scaling - how LLMs actually run and get better in production.
+Tensors, optimization, classical ML, training loops, architectures, and vision - the building blocks behind modern AI systems.
 :::
 
 :::

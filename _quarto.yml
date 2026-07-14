@@ -1,11 +1,16 @@
 project:
   type: website
+  resources:
+    - .nojekyll
 
 website:
   description: "A blog built with Quarto"
   site-url: https://maitreyasuin.github.io/blog
   title: "Maitreya - Notes"
   favicon: favicon.svg
+  open-graph: true
+  twitter-card: true
+  search: true
   navbar:
     left:
       - fundamentals.qmd
@@ -24,6 +29,9 @@ format:
     code-fold: true
     code-tools: true
     toc: true
+    include-in-header:
+      - _includes/google-site-verification.html
+      - _includes/goatcounter.html
 
 
 

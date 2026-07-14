@@ -6,3 +6,23 @@ freeze: true
 
 # Enable banner style title blocks
 title-block-banner: true
+
+# giscus comments - scoped to this folder only (posts), not the root-level
+# landing/category pages. Quarto's native `comments:` support auto-syncs the
+# giscus theme with the site's own light/dark toggle and injects the widget
+# at the true end of post content - better than embedding the raw giscus.app
+# script tag by hand.
+comments:
+  giscus:
+    repo: maitreyasuin/blog
+    repo-id: R_kgDOTSc-Ww
+    category: General
+    category-id: DIC_kwDOTSc-W84DBJke
+    mapping: pathname
+    reactions-enabled: true
+    input-position: top
+    loading: lazy
+    language: en
+    theme:
+      light: light
+      dark: dark
