@@ -1,17 +1,16 @@
 ---
 title: "⚙️ LLM Systems"
-listing:
-  contents: notes/llm-systems
-  type: default
-  categories: true
-  sort: "date desc"
-  sort-ui: false
-  filter-ui: false
-  fields: [image, date, title, depth, description, categories]
-  field-display-names:
-    depth: "Depth"
 page-layout: full
 title-block-banner: true
 ---
 
 Inference, post-training, and scaling - how LLMs actually run and get better in production.
+
+::: {.grid .home-cards}
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### [⚡ Inference](notes/llm-systems/inference/index.qmd)
+KV caching, FlashAttention, and continuous batching - how a trained model actually generates tokens fast.
+:::
+
+:::

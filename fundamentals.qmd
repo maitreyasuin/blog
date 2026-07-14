@@ -1,17 +1,16 @@
 ---
 title: "🧮 Fundamentals"
-listing:
-  contents: notes/fundamentals
-  type: default
-  categories: true
-  sort: "date desc"
-  sort-ui: false
-  filter-ui: false
-  fields: [image, date, title, depth, description, categories]
-  field-display-names:
-    depth: "Depth"
 page-layout: full
 title-block-banner: true
 ---
 
 Tensors, classical ML, training, architectures, and vision - the building blocks everything else in this site stands on.
+
+::: {.grid .home-cards}
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### [🔢 Tensors](notes/fundamentals/tensors/index.qmd)
+Strides, views, broadcasting, and the memory model underneath every tensor op.
+:::
+
+:::
