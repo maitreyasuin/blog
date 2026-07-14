@@ -1,0 +1,17 @@
+---
+title: "Generative"
+listing:
+  contents: notes/generative
+  type: default
+  categories: true
+  sort: "date desc"
+  sort-ui: false
+  filter-ui: false
+  fields: [image, date, title, depth, description, categories]
+  field-display-names:
+    depth: "Depth"
+page-layout: full
+title-block-banner: true
+---
+
+Diffusion, GANs/VAEs, vision-language models, and world models — generating pixels, video, and more.

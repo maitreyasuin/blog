@@ -3,13 +3,17 @@ title: "FlashAttention from First Principles: Exact Attention Without the O(n²)
 description: "Standard attention is slow because of memory traffic, not FLOPs. We derive online softmax and tiling, verify a reference implementation to machine precision, and write a Triton kernel."
 author: "Maitreya"
 date: today
-categories: [llm-inference, flash-attention, triton, gpu]
+categories: [llm-systems, inference]
+depth: "Deep dive"
 draft: true  # flip to false once [MEASURE] placeholders are filled in from a real Colab run
 freeze: true  # cache executed output; Actions renders without re-running code (no GPU there)
 format:
   html:
     code-fold: false
     toc: true
+aliases:
+  - /posts/flash-attention/
+  - /posts/flash-attention/index.html
 ---
 
 > **TL;DR** — Standard attention is slow not because of FLOPs but because it round-trips an $N\times N$ score matrix through GPU main memory. FlashAttention computes the *exact* same output while never materializing that matrix, by (1) an **online softmax** that turns softmax into a streamable, associative update, and (2) **tiling** the computation so each block of work lives entirely in on-chip SRAM. We derive both from scratch, verify a pure-PyTorch tiled implementation to machine precision, write a working Triton kernel, and benchmark memory and speed against naive attention and PyTorch SDPA. Result: same numbers out, `[MEASURE]`× faster, and sequence lengths that used to OOM now fit.

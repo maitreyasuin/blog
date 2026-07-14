@@ -3,7 +3,8 @@ title: "The KV Cache: Build It, Break It, Measure It"
 description: "Autoregressive decoding recomputes what it already knows. We build a KV cache from scratch on GPT-2, prove it's exact, break it three ways on purpose, and measure the price you pay for it."
 author: "Maitreya Suin"
 date: 2026-07-13
-categories: [llm-inference, kv-cache, pytorch, gpt-2]
+categories: [llm-systems, inference]
+depth: "Deep dive"
 draft: false
 freeze: true
 format:
@@ -11,6 +12,9 @@ format:
     code-fold: false
     code-tools: false
     toc: true
+aliases:
+  - /posts/kv-cache/
+  - /posts/kv-cache/index.html
 ---
 
 [📓 Google Colab Notebook](https://colab.research.google.com/github/maitreyasuin/blog/blob/main/notebooks/kv-cache/kv-cache.ipynb)

@@ -6,6 +6,9 @@ website:
   site-url: https://maitreyasuin.github.io/blog
   title: "Maitreya - Notes"
   navbar:
+    left:
+      - fundamentals.qmd
+      - llm-systems.qmd
     right:
       - about.qmd
       - icon: github

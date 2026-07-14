@@ -1,1 +1,41 @@
 /* css styles */
+
+/* Light mode: reuse dark mode's blue top bar (navbar + title banner, both #375a7f
+   in the darkly theme) instead of cosmo's default light-gray band. */
+body.quarto-light .navbar {
+  --bs-navbar-color: #dee2e6;
+  --bs-navbar-hover-color: rgba(255, 255, 255, 0.8);
+  --bs-navbar-disabled-color: rgba(222, 226, 230, 0.75);
+  --bs-navbar-active-color: #fff;
+  --bs-navbar-brand-color: #dee2e6;
+  --bs-navbar-brand-hover-color: #fff;
+  --bs-navbar-toggler-border-color: rgba(222, 226, 230, 0);
+  --bs-navbar-toggler-icon-bg: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3e%3cpath stroke='%23dee2e6' stroke-linecap='round' stroke-miterlimit='10' stroke-width='2' d='M4 7h22M4 15h22M4 23h22'/%3e%3c/svg%3e");
+  background-color: #375a7f;
+}
+
+body.quarto-light .quarto-title-banner,
+body.quarto-light .quarto-title-banner a,
+body.quarto-light .quarto-title-banner h1,
+body.quarto-light .quarto-title-banner .h1,
+body.quarto-light .quarto-title-banner h2,
+body.quarto-light .quarto-title-banner .h2 {
+  color: #dee2e6;
+}
+body.quarto-light .quarto-title-banner {
+  background-color: #375a7f;
+}
+
+/* "depth" listing field, shown as a small badge (see fundamentals/llm-systems/generative/agentic.qmd) */
+.listing-depth {
+  display: inline-block;
+  font-size: 0.75em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.15em 0.6em;
+  margin-top: 0.4em;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  opacity: 0.75;
+}

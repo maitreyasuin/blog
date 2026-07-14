@@ -3,13 +3,17 @@ title: "Continuous Batching: Build a Toy vLLM and Watch Latency Collapse"
 description: "A decode step is memory-bound, so serving one user wastes the GPU. We simulate iteration-level scheduling, explain PagedAttention, and build a slot-based serving engine on real GPT-2."
 author: "Maitreya"
 date: today
-categories: [llm-inference, serving, vllm, pagedattention]
+categories: [llm-systems, inference]
+depth: "Deep dive"
 draft: true  # flip to false once [MEASURE] placeholders are filled in from a real Colab run
 freeze: true  # cache executed output; Actions renders without re-running code (no GPU there)
 format:
   html:
     code-fold: false
     toc: true
+aliases:
+  - /posts/continuous-batching/
+  - /posts/continuous-batching/index.html
 ---
 
 > **TL;DR** — A decode step is memory-bound (Part 1): the GPU streams gigabytes of weights to emit one token, so serving one user leaves ~97% of the compute idle. Batching fixes utilization, but *static* batching makes everyone wait for the slowest request. **Continuous batching** reschedules at every iteration — requests join and leave the batch between tokens — and **PagedAttention** makes that practical by managing KV-cache memory like an OS manages RAM. We build both intuitions with a discrete-event simulator (median time-to-first-token drops ~60× in our runs) and then a working ~150-line slot-based serving engine on real GPT-2.
