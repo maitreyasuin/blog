@@ -2,7 +2,7 @@
 title: "Numerical Stability: The Window, and the Precision You Lose Inside It"
 description: "Floating-point arithmetic is not real arithmetic — it can only represent numbers inside a finite window, and outside it, exp overflows to infinity and tiny probabilities collapse to exactly zero. Many of the most common stability techniques share one move: rewrite the computation so dangerous intermediates stay representable. Cancellation then adds a second problem — preserving significant digits even when every intermediate is comfortably in range. Here are both, and the six places they matter — including the one that returns negative squared distances, turns them into NaN, and corrupts distance magnitudes without raising anything."
 categories: [tensors]
-date: 2026-08-25
+date: 2026-07-19
 depth: "Deep dive"
 format:
   html:

@@ -2,7 +2,7 @@
 title: "Selecting and Placing: gather, scatter, and the Indexing Model"
 description: "gather is the operation everyone re-derives from the docs every single time. Here is the one sentence that makes it stop being mysterious, the intuition that it's a one-hot matmul without the matrix, and the mutation rule that separates a copy from a view — where writing to the wrong one silently does nothing."
 categories: [tensors]
-date: 2026-08-18
+date: 2026-07-19
 depth: "Deep dive"
 format:
   html:
