@@ -1,0 +1,555 @@
+---
+title: "Numerical Stability: The Window, and the Precision You Lose Inside It"
+description: "Floating-point arithmetic is not real arithmetic — it can only represent numbers inside a finite window, and outside it, exp overflows to infinity and tiny probabilities collapse to exactly zero. Many of the most common stability techniques share one move: rewrite the computation so dangerous intermediates stay representable. Cancellation then adds a second problem — preserving significant digits even when every intermediate is comfortably in range. Here are both, and the six places they matter — including the one that returns negative squared distances, turns them into NaN, and corrupts distance magnitudes without raising anything."
+categories: [tensors]
+date: 2026-08-25
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+Here is a `softmax` — the most ordinary operation in deep learning, written exactly as the definition says — and here it is returning `nan` on inputs that are neither large nor strange:
+
+```{python}
+import torch
+def softmax_textbook(x):
+    e = torch.exp(x)
+    return e / e.sum(-1, keepdim=True)
+
+print(softmax_textbook(torch.tensor([1000., 1001., 1002.])).tolist())
+```
+
+Nothing is wrong with the math. The formula is correct in the real numbers, the inputs are three ordinary logits, and yet the answer is garbage — three `nan`s where three probabilities should be. The reason is the single fact this entire post is built around, so it's worth stating before anything else:
+
+> A floating-point number can only represent values inside a finite **window**. `fp32` tops out around $3.4 \times 10^{38}$; `fp16`, which half your model runs in, tops out at just `65504`. Step outside the window and arithmetic doesn't wrap or warn — it saturates to `inf`, or collapses to exactly `0`. And `exp` walks you outside that window terrifyingly fast: `exp(89)` already overflows `fp32`, and `exp(12)` overflows `fp16`.
+
+`exp(1002)` is `inf`. Then `inf / inf` is `nan`, and the whole vector is poisoned. That's the bug above, and once you see the window, the fix writes itself: before calling `exp`, *shift the numbers back inside the window*. That move — pull the values into the safe range before the dangerous operation, in a way that provably doesn't change the mathematical answer — is the dominant theme of this post, and five of its six cases are variations on it. But keeping numbers *inside* the window is not the whole story of numerical stability, and the sixth case is the reason: sometimes every intermediate is perfectly representable and you still get a catastrophically wrong answer, because *subtracting two nearly-equal numbers destroys the precision of the result*. That second failure mode — cancellation — comes from the same finite-precision world but has nothing to do with the window's edges, and it produces the most dangerous bug in the post.
+
+> **TL;DR** — Floats live in a finite window (`fp16` overflows above `exp(11)`, `fp32` above `exp(89)`), and outside it arithmetic saturates to `inf` or collapses to `0` silently. The softmax max-trick, `logsumexp`, `log_softmax`, the two-branch sigmoid, and logit-based cross-entropy are all the *same idea*: rewrite the computation so intermediate values stay inside the window without changing the real-valued result. Then there's a bug from the same world in different clothing — the standard vectorized distance formula subtracts two nearly-equal large numbers and returns **negative squared distances**, which `sqrt` turns into `nan` — and which corrupts distance *magnitudes* even where the sign survives. All six, with runnable failures and their fixes.
+
+## The window, and why exp is so dangerous near its edge
+
+Before the fixes, look at the window itself, because its size is the whole reason `fp16` is scary and `bf16` is not:
+
+```{python}
+import math
+for dt, name in [(torch.float16, 'fp16'), (torch.bfloat16, 'bf16'), (torch.float32, 'fp32')]:
+    fi = torch.finfo(dt)
+    print(f"{name}: largest value ~{fi.max:.2e}  |  exp(x) overflow boundary near x = {math.log(fi.max):.1f}")
+```
+
+Read the `fp16` row and feel the danger: an activation of `12` — a completely unremarkable value — overflows `exp` in half precision. This is also, in one line, why **`bf16` is usually the safer choice** for training: it has the *same exponent range as `fp32`* (same overflow threshold, `88.7`), so it's far less prone to the range-related overflow and underflow failures that plague `fp16` — at the cost of fewer precision bits, which makes rounding and cancellation *worse*. That trade is why `fp16` typically needs loss-scaling to keep small gradients from underflowing while `bf16` usually doesn't, though stability always remains workload- and hardware-dependent. The through-line for this post: range failures dominate anything built on exponentials and probabilities, while significand precision dominates the cancellation-sensitive computations we'll meet later — which is why this post needs both halves.
+
+With the window in view, here are the six places you keep your numbers inside it — and the one place the window's *grid spacing*, rather than its edges, is what bites.
+
+## Softmax: shift into the window before you exp
+
+The bug from the opening, and its fix, side by side:
+
+```{python}
+def softmax_stable(x):
+    e = torch.exp(x - x.max(-1, keepdim=True).values)   # subtract the max: shift into the window
+    return e / e.sum(-1, keepdim=True)
+
+logits = torch.tensor([1000., 1001., 1002.])
+print("textbook softmax:", softmax_textbook(logits).tolist())
+print("stable softmax  :", [round(v, 6) for v in softmax_stable(logits).tolist()])
+print("torch.softmax   :", [round(v, 6) for v in torch.softmax(logits, -1).tolist()])
+torch.testing.assert_close(softmax_stable(logits), torch.softmax(logits, -1))
+```
+
+The same trick also rescues the *other* edge of the window, which people forget exists — very negative inputs, where the failure looks identical but the cause is the opposite:
+
+```{python}
+def softmax_naive(x):
+    e = torch.exp(x)
+    return e / e.sum(-1, keepdim=True)
+
+logits = torch.tensor([-1000., -1001., -1002.])
+print("naive softmax :", softmax_naive(logits).tolist(), " <- exp underflows to 0, then 0/0")
+print("stable softmax:", [round(v, 6) for v in softmax_stable(logits).tolist()])
+```
+
+Subtracting the max fixes both, because it maps the largest logit to exactly 0 and every other to something ≤ 0. So `exp` is evaluated only on `(-∞, 0]`, where its range is `(0, 1]`. **The largest term is always exactly 1**, so the denominator can never underflow to zero, and nothing can overflow. State the domain, though, because it matters later: this argument holds for a **nonempty row of finite logits**. A row containing `+inf` gives `inf - inf = nan`; a row that is entirely `-inf` (every position masked) gives `0/0`; a `nan` anywhere poisons the max. Those aren't hypothetical — the fully-masked row is a whole section below.
+
+### Why the max trick is exact — and where "exact" stops being true
+
+Softmax is **shift-invariant**. For any constant `c`:
+
+$$\frac{e^{x_i - c}}{\sum_j e^{x_j - c}} = \frac{e^{-c}\,e^{x_i}}{e^{-c}\sum_j e^{x_j}} = \frac{e^{x_i}}{\sum_j e^{x_j}}$$
+
+The `e^{-c}` cancels. This is not an approximation; it's an identity. So why subtract the *max* specifically, rather than the mean, or 100, or anything convenient?
+
+Because shift-invariance holds in ℝ, and we are not in ℝ:
+
+```{python}
+torch.manual_seed(0)
+x = torch.randn(1000) * 5
+ref = torch.softmax(x, -1)
+
+for c in [0., 1e2, 1e3, 1e4, 1e5]:
+    got = torch.softmax(x + c, -1)
+    print(f"c = {c:>8.0f} : max abs diff = {(got - ref).abs().max().item():.3e}"
+          f"   identical? {torch.allclose(got, ref, atol=1e-7)}")
+```
+
+Adding a large `c` destroys the precision of `x` **itself** — fp32 holds ~7 significant digits, so `100000.0 + 0.001` rounds to `100000.0` and the information in the low bits of your logits is simply gone. The mathematical identity survives; the float doesn't.
+
+So the max is not an arbitrary choice among many valid shifts. Other shifts *can* keep you safe — any shift that maps the logits below the overflow threshold without underflowing the denominator would do — but the max is the **canonical** one because it buys two guarantees at once: every shifted logit is non-positive (so no exponential can overflow) and at least one is exactly zero (so the denominator is ≥ 1 and cannot underflow). It also doesn't push the whole vector further below the largest entry than necessary. That's a real argument for preferring it — though not a proof that it universally minimizes floating-point error, which would need more than this hand-waving. The best shift, not the only workable one, and a satisfying amount of design packed into one `.max()` call.
+
+## Staying in the window in log-space: why `log(softmax(x))` fails
+
+Softmax lives inside the window now. But the moment you take the *log* of a softmax — which you do constantly, because log-probabilities are what losses are built from — you can fall out of it again, from the other direction: not by overflowing to `inf`, but by underflowing to exactly `0` and then taking `log(0) = -inf`. The fix is the same philosophy — never leave the window — applied in log-space.
+
+```{python}
+import torch.nn.functional as F
+logits = torch.tensor([0., -50., -100., -800.])
+
+p = torch.softmax(logits, -1)
+print("softmax(x)      :", p.tolist())
+print("log(softmax(x)) :", torch.log(p).tolist())
+print("F.log_softmax(x):", F.log_softmax(logits, -1).tolist())
+```
+
+Two failures in one line, and they're different failures.
+
+At `-100`, the probability is `3.78e-44` — a **subnormal** float, right at the edge of fp32's range, where precision has already degraded. `log` of it gives `-99.983`, not `-100`. We've lost three digits.
+
+At `-800`, the probability underflowed to **exactly zero**. `log(0) = -inf`. The information is not degraded — it is *destroyed*. No amount of downstream care recovers it, and if that `-inf` contributes to a loss it can produce an infinite loss or non-finite gradients, depending on what the surrounding operation does with it.
+
+`log_softmax` never makes this mistake because it never materializes the probability:
+
+$$\log \text{softmax}(x)_i = x_i - \log\sum_j e^{x_j} = x_i - \text{logsumexp}(x)$$
+
+It computes the log directly, in log-space, staying in the range where fp32 is comfortable. Which brings us to the function everything above is secretly built on:
+
+```{python}
+x = torch.tensor([1000., 1001., 1002.])
+m = x.max()
+manual = m + torch.log(torch.exp(x - m).sum())        # the logsumexp identity
+
+print(f"naive log(sum(exp(x)))       = {torch.log(torch.exp(x).sum()).item()}")
+print(f"m + log(sum(exp(x - m)))     = {manual.item():.6f}")
+print(f"torch.logsumexp(x, -1)       = {torch.logsumexp(x, -1).item():.6f}")
+torch.testing.assert_close(manual, torch.logsumexp(x, -1))
+```
+
+$$\log\sum_j e^{x_j} = m + \log\sum_j e^{x_j - m}, \quad m = \max_j x_j$$
+
+That identity is the load-bearing beam of this entire subject. It's the same trick FlashAttention's online softmax generalizes to a streaming setting, and it's why `torch.logsumexp` exists as a primitive at all.
+
+## Sigmoid: two formulas, one for each side of the window
+
+The same window governs `sigmoid`, and the fix here is a small twist on "shift into the window": use a *different algebraic form* on each side, each one chosen so `exp` only ever sees a safe argument.
+
+$$\sigma(x) = \frac{1}{1 + e^{-x}}$$
+
+Perfectly fine — for `x ≥ 0`. For `x` very negative, `e^{-x}` explodes:
+
+```{python}
+import math
+
+def sigmoid_naive(x):
+    return 1 / (1 + torch.exp(-x))
+
+xs = torch.tensor([-1000., -5., 0., 5., 1000.], requires_grad=True)
+out = sigmoid_naive(xs)
+out.sum().backward()
+
+print("naive forward :", out.detach().tolist())
+print("naive gradient:", xs.grad.tolist())
+```
+
+**Look carefully at those two lines, because the failure is not where you'd expect.** The *forward* pass is correct — `exp(1000) = inf`, then `1/(1+inf) = 0`, which is the right limit. IEEE 754 saved us, and if you only ever checked the output you would conclude this function is fine.
+
+The **gradient** is `nan`. The derivative of the naive form involves the same `inf` intermediate, and `inf/inf² ` is `nan`. So your loss curve looks healthy, your forward values are right, and your weights quietly fill with `nan` from the backward pass. This is the recurring lesson of the whole post: **checking the forward value is not checking numerical stability.**
+
+The repair is to never let `exp` see a positive argument in the first place, by using a different — algebraically identical — form on each side of zero:
+
+$$\sigma(x) = \frac{1}{1 + e^{-x}} \quad (x \ge 0), \qquad \sigma(x) = \frac{e^{x}}{1 + e^{x}} \quad (x < 0)$$
+
+Both are the same function; each branch keeps its exponential's argument non-positive, so the exponential lands in `(0, 1]`, the denominator lands in `[1, 2]`, and for finite inputs no intermediate can overflow in any precision. In practice you should just call `torch.sigmoid`, which is finite in both directions:
+
+```{python}
+xs2 = torch.tensor([-1000., -5., 0., 5., 1000.], requires_grad=True)
+torch.sigmoid(xs2).sum().backward()
+print("torch.sigmoid gradient:", xs2.grad.tolist())
+```
+
+And why does this matter more than the `x = ±1000` toy suggests? Because of how small the `fp16` window is:
+
+```{python}
+for dt, name in [(torch.float16, 'fp16'), (torch.float32, 'fp32')]:
+    fmax = torch.finfo(dt).max
+    print(f"{name}: max representable = {fmax:g}  =>  exp(x) overflows for x > {math.log(fmax):.1f}")
+```
+
+**`x > 11.1`.** In half precision — routine in mixed-precision training — an activation of `12`, utterly unremarkable, overflows `exp` and starts this whole failure chain. That's why the two-branch form isn't a pedantic nicety.
+
+::: {.callout-warning}
+## A trap inside the fix
+
+The obvious way to write the two branches vectorized is `torch.where(x >= 0, 1/(1+z), z/(1+z))` with `z = exp(-x.abs())`. It gives the right *forward* values — and a **wrong gradient at `x = 0`**: `0.0`, where the true derivative is `0.25`. The cause is `abs()`, whose subgradient PyTorch takes to be zero at the origin; since both branch formulas route through `z = exp(-x.abs())`, that zero propagates into whichever branch gets selected. (You can confirm `where` isn't implicated by dropping it entirely: `1/(1+torch.exp(-x.abs()))` alone gives the same wrong `0.0` at the origin.)
+
+I wrote exactly that implementation while drafting this section, and only caught it by checking the gradient against `torch.sigmoid` rather than checking the forward values. Which is the running theme — and a good argument for using the built-in rather than hand-rolling. Eager `where` *is* a separate hazard, but it bites later in this post, when an unselected branch manufactures a non-finite intermediate.
+:::
+
+## The grid, not the edge: negative squared distances
+
+Every failure so far came from the *edges* of the window — values too big or too small to represent. This one is different, and it's my favourite, because there's no `exp` anywhere and it comes from the window's *grid spacing* instead of its edges: floats near a large value are spaced far apart, so subtracting two large nearly-equal numbers throws away all the meaningful digits. It destroys production systems, and it never raises a warning.
+
+The textbook vectorized distance uses the expansion $\|a-b\|^2 = \|a\|^2 + \|b\|^2 - 2a^\top b$, which lets you compute an entire `(N, N)` distance matrix with one matmul instead of materializing an `(N, N, D)` intermediate. Everyone does this — it's the standard trick in vectorized distance implementations and in every KNN tutorial you'll read.
+
+```{python}
+torch.manual_seed(1)
+D = 128
+X = torch.randn(500, D) * 10 + 100        # not centered — that's the trigger
+
+def dist_expanded(X):
+    sq = (X ** 2).sum(-1)
+    return sq[:, None] + sq[None, :] - 2.0 * (X @ X.T)
+
+d = dist_expanded(X)
+print(f"negative squared distances : {(d < 0).sum().item()} of {d.numel()}")
+print(f"most negative value        : {d.min().item():.4f}")
+print(f"d(x, x) should be 0; worst : {d.diagonal().abs().max().item():.4f}")
+print(f"NaNs after sqrt            : {torch.sqrt(d).isnan().sum().item()}")
+```
+
+A *squared* distance. Negative. And `sqrt` of it is `NaN`, which then propagates into your loss, your gradients, and your weekend.
+
+**Where do the negatives live?** I assumed "wherever two points are close." I was wrong, and the real answer is more useful:
+
+```{python}
+eye = torch.eye(500, dtype=torch.bool)
+neg = d < 0
+print(f"negatives ON the diagonal : {(neg &  eye).sum().item()} (of 500 diagonal entries)")
+print(f"negatives OFF the diagonal: {(neg & ~eye).sum().item()}")
+```
+
+**All** of them are on the diagonal — *for this data*. Self-distances are the *most vulnerable* entries: `d(x,x)` is the one place whose true value is exactly zero, so even a tiny absolute error is enormous relative to the result, and roughly half the time it lands on the negative side. (Vulnerable, not doomed — the expanded form can also return exactly zero, or a small positive value; it just has nothing holding it to the right side.) But be careful with the generalization (an earlier draft of this post got it wrong): the real condition is **true distance small relative to the noise floor set by ‖x‖²**. In this dataset the typical off-diagonal distance is ~25,000 against a noise floor of ~2, so only the diagonal qualifies. Make two points *nearly* identical and the off-diagonal falls too — as we're about to do, deterministically.
+
+The mechanism is **catastrophic cancellation**. With `‖x‖² ≈ 1.29e6` and `2x·x ≈ 1.29e6`, you are subtracting two large, nearly equal numbers to get something near 0. fp32 carries ~7 significant digits, so the top ~7 digits cancel exactly and what survives is *rounding noise from the inputs*, amplified into the output. The absolute error here is `±1.5` — which is nothing next to `1.29e6`, and catastrophic next to `0`.
+
+### Does centering fix it?
+
+I thought so. It doesn't — and this is the more interesting result:
+
+```{python}
+Xc = X - X.mean(0, keepdim=True)
+dc = dist_expanded(Xc)
+d_direct  = ((X[:, None, :]  - X[None, :, :])  ** 2).sum(-1)
+dc_direct = ((Xc[:, None, :] - Xc[None, :, :]) ** 2).sum(-1)
+
+print(f"uncentered: ||x||^2 ~ {(X**2).sum(-1).mean():.0f} | max error {(d - d_direct).abs().max():.4f}")
+print(f"centered  : ||x||^2 ~ {(Xc**2).sum(-1).mean():.0f} | max error {(dc - dc_direct).abs().max():.4f}")
+print(f"\ncentered negatives: {(dc < 0).sum().item()} — still all on the diagonal")
+```
+
+Centering shrinks the error by ~**170×**, which genuinely matters for the off-diagonal entries. But shrinking the error scale does not *guarantee* the diagonal comes out non-negative, because its true value is exactly zero and the remaining noise still has a sign. Scaling arguments help; they don't resolve structural ones.
+
+### And it is not only the diagonal
+
+Here's the deterministic counterexample that kills the "just fix the diagonal" mental model. Two *distinct* points, far from the origin, one centimeter apart:
+
+```{python}
+close = torch.full((2, 16), 100_000.0)
+close[1, 0] += 0.01                                # a genuinely different point
+
+d_dir = ((close[0] - close[1]) ** 2).sum().item()  # direct subtraction
+d_exp = dist_expanded(close)[0, 1].item()          # expanded formula
+
+print(f"direct   : {d_dir:.6e}")
+print(f"expanded : {d_exp:+.5e}")
+```
+
+The true squared distance is about `6e-5`. The expanded formula reports **negative thirty-two thousand** — an off-diagonal entry, between two different points. The mechanism is the same cancellation, just fed bigger numbers: `‖x‖² ≈ 1.6×10¹¹`, and fp32's spacing between representable values at `3.2×10¹¹` is about `3.3×10⁴`. The entire answer lives *below one unit in the last place* of the intermediates. The `-32768` isn't even an error estimate — it's literally one grid step of the float lattice.
+
+Two smaller cuts from the same experiment, both worth a beat:
+
+- Notice `direct` says `6.1e-05`, not the `1e-04` you'd compute by hand from `0.01²`. That's because **the perturbation itself got rounded on storage**: fp32's spacing at `100000` is `0.0078125`, so `100000 + 0.01` snaps to the nearest representable value before any distance code runs. Try `+= 0.001` and the two points become *bitwise identical* — your "distinct" test case silently collapses to a duplicate.
+- This is why "near-duplicate detection at large offsets" is close to the worst-case workload for the expanded formula — and it's precisely the workload of dedup pipelines and retrieval systems.
+
+### The silent damage: magnitudes first, rankings when margins are small
+
+The `nan` at least announces itself. But you might wonder whether the *ranking* survives — maybe the corrupted distances still sort into the right nearest neighbours, and the bug is cosmetic. Let me check that carefully, because it's easy to check it *wrong*. The naive instinct is to compare the top-k index lists position by position:
+
+```{python}
+k = 5
+# reference in float64: the fp32 direct form is much better than the expanded one,
+# but it is not exact either, so the oracle should be a precision above what we're judging.
+d_reference = ((X.double()[:, None, :] - X.double()[None, :, :]) ** 2).sum(-1)
+
+nn_fast = dist_expanded(X).topk(k, largest=False).indices
+nn_ref  = d_reference.topk(k, largest=False).indices     # self-neighbour included
+print(f"position-by-position agreement: {(nn_fast == nn_ref).float().mean().item()*100:.2f}%")
+```
+
+99.76% — which *looks* like "the ranking is slightly corrupted," and it would be tempting to spin a story about wrong neighbours. But that number is measuring the wrong thing. Two neighbour lists can contain the *same* neighbours in a *different order* — which happens constantly when near-equal distances swap rank — and position-equality counts that as a mismatch even though the neighbour *set* is identical. The metric that actually answers "did we retrieve the right neighbours" is set recall:
+
+```{python}
+def recall_at_k(pred, ref):
+    """Fraction of each row's reference neighbours that appear anywhere in the predicted set."""
+    matches = (pred.unsqueeze(-1) == ref.unsqueeze(-2)).any(-1).sum(-1)
+    return matches.float() / ref.shape[-1]
+
+r = recall_at_k(nn_fast, nn_ref)
+print(f"set recall@{k}:              {r.mean().item()*100:.2f}%")
+print(f"queries with any disagreement: {(r < 1).float().mean().item()*100:.2f}%")
+```
+
+**100% set recall.** For this dataset, seed, scale and `k = 5`, both methods retrieved the *same neighbour sets*; only the internal ordering differed — which is what the position-equality metric was penalizing. Be careful what that does and doesn't establish: it shows the observed errors never pushed a point across the top-5 set boundary here. It does *not* establish that the reordered pairs were exactly tied (they may have been near-ties, or genuinely distinct distances whose order the error flipped), and it certainly doesn't make the expanded formula ranking-safe in general — push the errors up against the gaps between neighbours and rankings will move. Still a genuinely useful thing to know, and I'd have missed it entirely if I'd trusted the position-equality number. (This is the same lesson as `topk`'s tie instability from the indexing post, showing up again: position is not identity.)
+
+Which sharpens where the damage actually showed up in this experiment. It was *not* incorrect neighbour sets. It was two other things, both quiet in their own way:
+
+- **The `nan` itself.** `sqrt` of those 195 negative entries produces `nan`, and a `nan` contributing to your loss can propagate broadly through the backward pass — a loud failure, but one whose *cause* (a distance formula, of all things) is deeply unobvious.
+- **Corrupted distance *magnitudes*.** Even where the sign survives, the *values* are wrong by the cancellation error — the ranking happened to survive here, but that's no comfort if you feed the distances themselves into an RBF kernel, a temperature-scaled contrastive loss, or anything that uses the magnitude rather than just the order.
+
+So the honest summary is subtler and more interesting than "wrong neighbours once every 500 lookups" (which I can now show would have been false): here the *ordering* survived, the *magnitudes* did not, and `sqrt` turns the sign errors into `nan`s that surface far from their cause.
+
+### The fixes, in order
+
+```{python}
+raw     = dist_expanded(X)
+clamped = raw.clamp_min(0)            # out-of-place: keep `raw` around to inspect
+print("1. clamp   :", f"{(clamped < 0).sum().item()} negatives, "
+      f"{clamped.sqrt().isnan().sum().item()} NaNs")
+print("2. cdist   :", f"{(torch.cdist(X, X) < 0).sum().item()} negatives, "
+      f"{torch.cdist(X, X).isnan().sum().item()} NaNs")
+print("3. float64 :", f"{(dist_expanded(X.double()) < 0).sum().item()} negatives, "
+      f"worst diagonal {dist_expanded(X.double()).diagonal().min().item():.2e}")
+```
+
+- **`.clamp_min(0)`** — the one-line patch, when your application's contract needs a real non-negative result. *Small* negatives from expected rounding can be clamped before `sqrt`; *large* negatives (like our `-32768`) should be read as evidence that the formulation or precision is inadequate, not quietly clamped away. Either way, be honest about what clamp buys: it restores the **invariant** (squared distances non-negative, `sqrt` won't `nan`), not the **accuracy**. The `6e-5` separation in the counterexample is unrecoverable — clamped, it reports `0`, i.e. "these points are identical," still the wrong answer. If near-duplicate geometry is what you care about, use the direct form (chunked over blocks if memory forces it) or fp64 for that region.
+- **`torch.cdist`** — the maintained high-level starting point, *provided you check which compute mode you're actually getting on numerically awkward data*. Do not file it under "handled." `cdist` chooses between a direct implementation and the same expanded-matmul form we just indicted, based on its `compute_mode` argument — and the default heuristic switches to the matmul path once either input has more than 25 points. On our own counterexample that is not a subtle difference:
+
+```{python}
+import platform
+print(f"[python {platform.python_version()} | torch {torch.__version__} | "
+      f"{'cuda' if torch.cuda.is_available() else 'cpu'}]  <- these exact values are build-specific\n")
+
+close = torch.full((2, 16), 100_000.0)
+close[1, 0] += 0.01
+direct = ((close[0] - close[1]) ** 2).sum().sqrt()
+
+# note: 0.0078 is the distance between the STORED fp32 values — the requested +0.01
+# increment is itself rounded on storage at this magnitude (see the counterexample above).
+print(f"direct distance                      : {direct.item():.6f}")
+for mode in ["use_mm_for_euclid_dist_if_necessary",
+             "donot_use_mm_for_euclid_dist",
+             "use_mm_for_euclid_dist"]:
+    d = torch.cdist(close, close, compute_mode=mode)[0, 1]
+    print(f"cdist [{mode:35s}]: {d.item():.6f}")
+```
+
+  On the build these numbers were produced on, the matmul mode reports a distance of **128** where the true distance is **0.0078** — not a rounding discrepancy but a fabricated number, four orders of magnitude too large. (The precise wrong values will vary with version, backend and dtype; the failure mode is the durable part.) And because the default heuristic *chooses* that path above 25 points, scaling the same data up flips you onto it silently:
+
+```{python}
+big = torch.full((30, 16), 100_000.0)          # 30 points: past the >25 heuristic threshold
+big[1:, 0] += 0.01
+print(f"direct  : {((big[0]-big[1])**2).sum().sqrt().item():.6f}")
+print(f"default cdist: {torch.cdist(big, big)[0, 1].item():.6f}   <- 'these points are identical'")
+```
+
+  Here the default path reports **0.0** — declaring two genuinely distinct points identical, with no warning, on a routine call with no unusual arguments. The practical rule: `cdist`'s numerical behaviour depends on dtype, scale, shape *and* `compute_mode`, so if your data sits far from the origin or your points are near-duplicates, either pass `compute_mode="donot_use_mm_for_euclid_dist"` explicitly or test the mode you're actually getting against a higher-precision direct reference.
+- **fp64** — carries roughly 16 significant decimal digits against fp32's 7, which is why it makes an excellent *reference* to measure your fp32 error against. It does not make an ill-conditioned formulation exact (the expanded form in fp64 still leaves a small nonzero diagonal), and its runtime cost is hardware- and operation-dependent rather than a fixed multiplier. A diagnostic, not a fix.
+
+If you take one thing from this section: **when you use the expanded form, check the scale of the negatives before you clamp.** Small ones are ordinary rounding and `clamp_min(0)` before `sqrt` is a reasonable repair; large ones — like our `-32768` — are telling you the formulation or the precision is wrong for this data, and clamping them is hiding the evidence rather than fixing the bug.
+
+## A different failure: `0 × inf = nan` and unsafe masking
+
+```{python}
+data = torch.tensor([1., 2., float('inf'), 4.])
+mask = torch.tensor([True, True, False, True])       # mask OUT the inf
+
+mul   = (data * data * mask.float()).sum()
+where = torch.where(mask, data * data, torch.zeros_like(data)).sum()
+
+print(f"multiply-by-mask : {mul.item()}")
+print(f"torch.where      : {where.item()}")
+```
+
+You masked the `inf` out. It poisoned the sum anyway, because `inf × 0 = nan` and `nan + anything = nan`.
+
+`torch.where` **selects** — the discarded value never enters the *sum*. But before you file this under "solved," here's the part that most treatments (including an earlier draft of this one) stop short of:
+
+### `torch.where` is eager, and the backward pass knows it
+
+`where` is not lazy. **Both branches are fully evaluated**; selection happens after. In the forward pass that was fine — `inf² = inf` is a legal value being discarded. Watch the backward:
+
+```{python}
+data = torch.tensor([1., 2., float('inf'), 4.], requires_grad=True)
+mask = torch.tensor([True, True, False, True])
+
+loss = torch.where(mask, data * data, torch.zeros_like(data)).sum()
+loss.backward()
+print("forward :", loss.item())
+print("gradient:", data.grad.tolist())
+```
+
+**Finite forward, NaN gradient.** The chain rule for the masked slot multiplies the incoming gradient (0, correctly, from `where`) by the local derivative of the square (`2 · data = inf`) — and `0 × inf = nan` is back, one level down, where your loss curve looks perfectly healthy and your weights quietly rot. This is a long-standing, well-documented autograd sharp edge (search "torch.where NaN gradient"), and it's the difference between a tutorial answer and a production one.
+
+The genuinely safe pattern: **sanitize the input *before* the dangerous op**, not the output after —
+
+```{python}
+data2 = torch.tensor([1., 2., float('inf'), 4.], requires_grad=True)
+safe  = torch.where(mask, data2, torch.zeros_like(data2))   # inf never enters the square
+loss2 = (safe * safe).sum()
+loss2.backward()
+print("forward :", loss2.item())
+print("gradient:", data2.grad.tolist())
+assert torch.isfinite(data2.grad).all()      # the whole point of rung 3
+```
+
+So the full ladder, worst to best:
+
+1. `(x*x*mask).sum()` — **forward NaN** (`0 × inf` in the sum).
+2. `where(mask, x*x, 0).sum()` — forward fine, **backward NaN** (`0 × inf` in the chain rule).
+3. `where(mask, x, 0)` **then** square — forward fine, backward fine. The garbage value never touches an op whose derivative can amplify it.
+
+If you only train in `no_grad` contexts, rung 2 suffices. If gradients ever flow, rung 3 is the only one that holds.
+
+## When the whole row is masked: softmax over nothing
+
+```{python}
+torch.manual_seed(0)
+scores  = torch.randn(1, 4)
+allmask = torch.ones(1, 4, dtype=torch.bool)         # every key masked
+
+print("with -inf:", torch.softmax(scores.masked_fill(allmask, float('-inf')), -1).tolist())
+print("with -1e9:", [round(v, 4) for v in
+                     torch.softmax(scores.masked_fill(allmask, -1e9), -1)[0].tolist()])
+```
+
+Every score is `-inf` → every `exp` is `0` → the denominator is `0` → `0/0 = nan`.
+
+"But a row is never fully masked!" It is: a zero-length sequence that slipped through your collate function, a query attending only to a padded region, a document with all tokens filtered. It happens in production and it happens at 3am.
+
+### And `-1e9` is not the fix — it's an fp32 habit
+
+The classic remedy — BERT-era code is full of it — is a large finite negative like `-1e9`. Now put your model in half precision, where the maximum representable magnitude is **65,504**:
+
+```{python}
+#| error: true
+scores16 = torch.randn(1, 4, dtype=torch.float16)
+scores16.masked_fill(allmask, -1e9)
+```
+
+That's the *lucky* failure — a loud one. The additive-mask idiom fails silently:
+
+```{python}
+masked_add = scores16 + (-1e9) * allmask.half()      # -1e9 overflows fp16 to -inf
+print("additive -1e9 in fp16:", masked_add.tolist())
+print("softmax of that      :", torch.softmax(masked_add, -1).tolist())
+```
+
+Your carefully chosen finite sentinel round-trips through fp16 and comes out as the exact `-inf` you were avoiding. The dtype-aware fix is one call:
+
+```{python}
+neg = torch.finfo(scores16.dtype).min                # -65504.0 in fp16, -3.4e38 in fp32
+print(torch.softmax(scores16.masked_fill(allmask, neg), -1).tolist())
+```
+
+One honest step further, because the uniform row is a patch, not an answer: a fully-masked query now attends *equally to positions you declared invalid*, and its output is an average of garbage. Whether that's fine depends on what happens downstream — if those rows are dropped, harmless; if they feed anything real, you've traded a loud `nan` for a quiet lie. So pick a **policy** and implement it. Here's one — *a fully-invalid row produces all zeros* — small enough to read and strict enough to test:
+
+```{python}
+def masked_softmax(logits, valid, dim=-1):
+    """Softmax over valid positions. A fully-invalid row returns all zeros, never NaN.
+
+    Contract: `logits` is floating point; `valid` is boolean and broadcast-compatible;
+    and every VALID logit is finite. That last precondition is real — a valid +inf,
+    -inf or nan will still produce nan here, because softmax has nothing sensible to
+    return for it. Validate upstream if your inputs can be non-finite."""
+    has_valid = valid.any(dim=dim, keepdim=True)
+    masked = logits.masked_fill(~valid, -torch.inf)               # -inf, NOT a finite sentinel
+    safe   = torch.where(has_valid, masked, torch.zeros_like(masked))  # dead rows: keep finite
+    p = torch.softmax(safe, dim=dim)
+    return torch.where(valid & has_valid, p, torch.zeros_like(p))  # and zero the dead rows
+
+torch.manual_seed(0)
+logits = torch.randn(3, 4, requires_grad=True)
+valid  = torch.tensor([[True, True, False, False],    # partially masked
+                       [True, True, True,  True ],    # fully valid
+                       [False,False,False, False]])   # fully masked
+
+p = masked_softmax(logits, valid)
+print("row sums:", [round(v, 4) for v in p.sum(-1).detach().tolist()])
+torch.testing.assert_close(p[:2].sum(-1), torch.ones(2))   # live rows normalize
+torch.testing.assert_close(p[2].sum(), torch.tensor(0.))    # dead row is exactly zero
+p.sum().backward()
+assert torch.isfinite(logits.grad).all()
+print("all gradients finite?", torch.isfinite(logits.grad).all().item())
+print("fp16 safe too?", torch.isfinite(masked_softmax(torch.randn(3, 4, dtype=torch.float16), valid)).all().item())
+
+# the edge case that kills a finite sentinel: a VALID logit sitting at the dtype minimum
+extreme = torch.full((1, 4), torch.finfo(torch.float32).min)
+one_ok  = torch.tensor([[True, False, False, False]])
+print("valid-logit-at-dtype-min row sums to:", masked_softmax(extreme, one_ok).sum().item())
+```
+
+Note what the tests assert. The dead row sums to **0**, not 1 — that's the policy, made visible and checkable, rather than a uniform distribution pretending to be an answer. And that last case is why the sentinel is `-inf` rather than the `finfo(dtype).min` you might reach for after the previous section: a *valid* logit sitting at the dtype minimum would **tie** with every finite sentinel, so softmax would hand real probability mass to positions you masked out, and the row would sum to `0.25` instead of `1`. (I wrote it with the finite sentinel first. The test above is what caught it.) `-inf` can't tie with a finite value, and the `has_valid` guard is what stops `-inf` from producing `0/0` on a row where *everything* is masked. Another application might reasonably raise instead, or drop the row upstream at the collate boundary, or keep a designated always-valid fallback token. What matters is that "attention over nothing" has a *defined* meaning in your system, and a test that pins it down.
+
+## Why it all comes together in `F.cross_entropy`
+
+Every trick above is a special case of "keep the numbers in the window," and `F.cross_entropy` is where they all pay off at once — it's the reason the API takes *logits* rather than probabilities:
+
+```{python}
+torch.manual_seed(0)
+logits  = torch.randn(3, 5, requires_grad=True)
+targets = torch.tensor([1, 0, 4])
+
+loss = F.cross_entropy(logits, targets)      # LOGITS, not probabilities
+loss.backward()
+
+p = torch.softmax(logits.detach(), -1)
+y = F.one_hot(targets, 5).float()
+expected = (p - y) / 3                        # /N: cross_entropy averages over the batch
+
+print("autograd gradient  :", logits.grad[0].numpy().round(4))
+print("(softmax(x) - y)/N :", expected[0].numpy().round(4))
+torch.testing.assert_close(logits.grad, expected, atol=1e-6, rtol=1e-5)
+print("autograd matches the closed form  ✓")
+```
+
+Two things fall out of this, and they're the reason the whole API is designed this way.
+
+**First**, for class-index targets `F.cross_entropy` is mathematically equivalent to a stable `log_softmax` followed by `nll_loss` — computed in log-space throughout, so it never has to materialize the tiny probability that produced the `log(0) = -inf` earlier. (Whether the implementation literally fuses those steps is PyTorch's business; the guarantee that matters to you is the log-space formulation.) If you softmax yourself and then take a log, you have manually re-introduced the exact bug the fused op exists to prevent. (`torch.nn.BCEWithLogitsLoss` is the same idea for the binary case, and the same warning applies: never `sigmoid` then `BCELoss`.)
+
+**Second**, look at that gradient: **`∂CE/∂logits = softmax(logits) − onehot`**. Predicted probability minus truth. That's it — beautifully simple, numerically well-behaved, bounded in `[-1, 1]`. (Two honest qualifications: this clean form is for a *single, unweighted, hard-label* example; the mean reduction over `N` examples introduces the `1/N` you see in the code, and class weights, label smoothing, or soft targets all modify the expression. And `F.cross_entropy` is *mathematically equivalent* to log-softmax followed by negative-log-likelihood — the precise implementation and whether it fuses the steps is PyTorch's to decide.) It is this clean *because* the loss is defined on logits — the `log` and the `exp` cancel analytically in the chain rule before any float is computed. Hand the loss probabilities instead and you throw away that cancellation and re-derive the instability by hand.
+
+That's a nice place to end, actually: the numerically-stable version isn't a defensive hack bolted onto the math. It falls out of doing the math *properly first* and only then converting to floats.
+
+## A few more from the same world
+
+**Debugging a `nan` when it appears.** `torch.autograd.set_detect_anomaly(True)` finds the operation that produced it (slow — development only). Lighter and always-on: check `if not torch.isfinite(loss): raise FloatingPointError(...)` in the training loop (a bare `assert` vanishes under `python -O`, so use an explicit raise for something this important), plus a forward hook that checks activations. The `nan` is almost never where you *notice* it — it surfaces in the loss, but it was usually born several operations upstream, at the first overflow, underflow, unsafe derivative, or catastrophic cancellation.
+
+**`log1p` and `expm1`.** `torch.log1p(x)` and `torch.expm1(x)` compute `log(1+x)` and `exp(x)-1` accurately for tiny `x`, where the naive form loses every digit to the same cancellation that produced negative distances. Same disease, same family of cures — reach for them whenever you're adding or subtracting 1 from something small.
+
+**A note for NumPy users.** All of this is identical in NumPy — same window, same `exp` overflow — with two differences worth knowing. NumPy raises a visible `RuntimeWarning: overflow encountered in exp` by default (PyTorch is quieter), and the stable primitives live in `scipy.special`: `scipy.special.softmax`, `logsumexp`, `expit` (the stable sigmoid), and `log1p`/`expm1` in `numpy` directly. If you've been relying on NumPy's warnings to catch these, know that the same code in PyTorch will fail more silently.
+
+## What to carry away
+
+Floating-point numbers live in a finite window, and stepping outside it doesn't raise — it saturates to `inf` or collapses to `0`, and your correct-on-paper formula returns `nan`. Most of the standard stability techniques are one move against that fact, with cancellation as the separate second problem:
+
+- **Softmax, `logsumexp`, `log_softmax`, the two-branch sigmoid, logit-based cross-entropy** are all the same idea — rewrite the computation so intermediate values stay inside the window, in a way that provably doesn't change the real-valued answer. Subtract the max; work in log-space; pick the algebraic form whose `exp` argument is safe. The stable version is never a hack bolted onto the math; it *is* the math, done carefully before converting to floats.
+- **`bf16` is usually the safer training dtype** for exactly this reason: its `fp32`-like exponent range makes range-related overflow and underflow far less likely than in `fp16`, while its smaller significand can make rounding and cancellation worse. Loss scaling is usually less central for `bf16`, but the right dtype stays workload- and hardware-dependent.
+- **The distance bug is the window's grid, not its edge** — subtracting two large nearly-equal numbers destroys precision and returns negative squared distances, which `sqrt` turns into `nan`. It corrupts distance *magnitudes*, and can disturb rankings when the error approaches the gap between neighbours; in the experiment here the top-5 sets happened to survive, which is a fact about that data, not a guarantee. Clamping restores the invariant, not the accuracy.
+- **`0 × inf = nan`** means masking by multiplication is unsafe, and `torch.where` selects between *already-evaluated* branches — it doesn't prevent unsafe arithmetic in the branch it later discards, so if gradients flow, sanitize the *input* before the dangerous op (the order is: sanitize → operate → reduce).
+
+If one sentence survives: *your formula is written in the real numbers but evaluated on a finite grid inside a finite window, and numerical stability is the discipline of choosing an algebraically equivalent computation whose intermediates both stay representable **and** preserve the significant digits the final answer depends on.*
+
+## Where this goes next
+
+This closes the tensor-fundamentals arc: we've moved data by shape, combined it across axes, selected it by index, and now kept it numerically sound. The threads converge on the operation they were all quietly building toward — attention — where the softmax stability of this post, the axis algebra of the broadcasting post, and the memory layout of the strides post all show up in one kernel. That's where the next group of posts begins.
+
+## References
+
+- [What Every Computer Scientist Should Know About Floating-Point Arithmetic](https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html) — Goldberg, 1991. Still the source. Read §1 on cancellation and you'll never write an expanded-distance formula unguarded again.
+- [`torch.logsumexp`](https://pytorch.org/docs/stable/generated/torch.logsumexp.html), [`torch.cdist`](https://pytorch.org/docs/stable/generated/torch.cdist.html) — note `cdist`'s `compute_mode` argument.
+- Milakov & Gimelshein, [*Online normalizer calculation for softmax*](https://arxiv.org/abs/1805.02867), 2018 — the streaming generalization of the max trick, and the mathematical core of FlashAttention.
+- [PyTorch: automatic mixed precision](https://pytorch.org/docs/stable/amp.html) — where the fp16 range limit becomes a loss-scaler.
+- [PyTorch: numerical accuracy notes](https://pytorch.org/docs/stable/notes/numerical_accuracy.html) — the official fine print on reduced-precision reductions, batched-op variance, and why bitwise reproducibility across devices was never promised to you.

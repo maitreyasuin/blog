@@ -1,0 +1,327 @@
+---
+title: "Selecting and Placing: gather, scatter, and the Indexing Model"
+description: "gather is the operation everyone re-derives from the docs every single time. Here is the one sentence that makes it stop being mysterious, the intuition that it's a one-hot matmul without the matrix, and the mutation rule that separates a copy from a view — where writing to the wrong one silently does nothing."
+categories: [tensors]
+date: 2026-08-18
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+You have three search queries, and for each one, a model has scored six candidate documents. You want, for each query, the two best documents — not their scores, which you already have, but the actual document *vectors*, pulled out and stacked so you can do something with them. Here is the setup:
+
+```{python}
+import torch
+torch.manual_seed(0)
+
+scores     = torch.randn(3, 6)        # 3 queries, a score for each of 6 candidates
+candidates = torch.randn(3, 6, 4)     # 3 queries, 6 candidates, each a 4-dim vector
+```
+
+The first half is easy — `topk` hands you the top two scores *and where they were*:
+
+```{python}
+top_scores, top_idx = torch.topk(scores, k=2, dim=-1)
+print("top scores:", tuple(top_scores.shape), " their positions:", tuple(top_idx.shape))
+print("query 0 picked candidates at positions:", top_idx[0].tolist())
+```
+
+(One caveat on `topk` worth knowing, since we lean on it: when scores tie, the *positions* it returns for the tied values aren't guaranteed to be stable across versions or backends. `sorted=True` orders the returned values, but ties among them have no defined index order. If your downstream logic needs deterministic tie-breaking, you have to encode that policy yourself.)
+
+Now the second half, which is the whole subject of this post: you have *indices* — query 0 wants candidates 3 and 4 — and you need to use them to reach into `candidates` and pull out the right vectors. This is "selection by index," and it feels like it should be a one-liner, and it is, but which one-liner, and why it has the exact shape rules it has, is something most people look up every time they need it. By the end of this post you won't have to. The operation is `gather` (and its friendlier sibling `take_along_dim`), its write-direction counterpart is `scatter`, and both come from a single idea that, once you see it, makes the shape rules obvious instead of arbitrary.
+
+> **TL;DR** — `gather` has one rule: the output takes the shape of the *index*, and the index replaces the coordinate **only along the chosen dimension** — every other coordinate passes through unchanged. That's why the index must have the same rank as the input. Underneath, `gather` is algebraically a sparse one-hot selection with the matrix never built — which is what makes it differentiable with respect to the selected *values* (though not, of course, the discrete indices). Its write-direction counterpart, `scatter` (and `scatter_add`), *writes* into indexed positions — a true inverse only when the coordinate map is a collision-free permutation. And a trap that has nothing to do with either: advanced indexing returns a **copy** while slicing returns a **view**, so writing to a stored advanced-index result silently updates nothing.
+
+## The one rule
+
+Here is `gather`, and here is the only thing you need to memorize about it:
+
+```
+torch.gather(input, dim, index)
+
+out[i, j, k] = input[ i, index[i, j, k], k ]        # for dim == 1
+                     ~~~~~~~~~~~~~~~~~~~~
+                     ONLY this coordinate is replaced by the index;
+                     i and k are taken from the output position itself
+```
+
+Read that formula and every rule about `gather` falls out of it as a consequence rather than a fact to memorize:
+
+- **The output has the shape of `index`.** Because `out[i,j,k]` is defined for exactly the positions `index` has.
+- **`index` must have the same rank as `input`.** Because the formula needs an index value at every `(i, j, k)`, and `i` and `k` range over `input`'s other axes — so `index` needs those axes too.
+- **Every axis except `dim` passes through untouched.** The `i` and the `k` in `input[i, index[...], k]` come straight from the output coordinate; only the middle slot is redirected.
+
+The rest of the contract falls out of the same formula, and it's worth having all of it in one place, because these are the constraints that produce the error messages:
+
+```python
+# the gather contract
+index.ndim == input.ndim              # same rank; they do NOT broadcast against each other
+index.dtype == torch.int64            # the documented contract (a LongTensor)
+output.shape == index.shape           # the output is index-shaped, not input-shaped
+index.shape[d] <= input.shape[d]      # for every d != dim
+0 <= index < input.shape[dim]         # in range; unlike advanced indexing, negatives do NOT wrap
+# index and input must be on the same device.
+# Gradients flow to the selected input VALUES; the integer indices are not differentiable.
+```
+
+One version note, since it's the kind of thing people trade folklore about: PyTorch's docs specify a `LongTensor` index, and on the build I tested `int32` is *also* accepted (while `int16` and `int8` are rejected outright). Interesting, but not something to lean on — the documented contract is `int64`, so that's what portable code should pass. Worth knowing the difference between "what my build happens to allow" and "what the API promises."
+
+Now apply it to the retrieval problem. We have `candidates` of shape `(query, candidate, feature)` and we want to select along the **candidate** axis (dim 1), keeping query and feature. The index `top_idx` has shape `(query, 2)` — but `gather` needs it to have the same rank as `candidates`, which is 3. So we add the missing feature axis and let it broadcast across all four features (the *same* candidate index applies to every feature of that candidate):
+
+```{python}
+picked = torch.gather(candidates, dim=1, index=top_idx.unsqueeze(-1).expand(-1, -1, 4))
+print("picked shape:", tuple(picked.shape), " (query, top-k, feature)")
+```
+
+That `unsqueeze(-1).expand(-1, -1, 4)` is the piece everyone fumbles, and it's fumbled precisely because the rank rule feels arbitrary until you've seen the formula. It isn't arbitrary: `gather` needs an index at every output position, the output has a feature axis, so the index needs one too — and `expand` (stride-0, from the strides post) supplies it for free since the same candidate index governs all its features.
+
+Because this specific pattern is so common, PyTorch gives you a version that absorbs that step:
+
+```{python}
+picked_easy = torch.take_along_dim(candidates, top_idx.unsqueeze(-1), dim=1)
+print("take_along_dim matches gather?", torch.equal(picked_easy, picked))
+```
+
+`take_along_dim` is the one I actually reach for — in this pattern it accepts the trailing singleton index axis and broadcasts it across the feature dimension, so the explicit `expand` — the step that causes the bugs — never appears in your code at all. (NumPy users: this is exactly `np.take_along_axis`, and `np.put_along_axis` is the writing version we'll get to.) But it's worth being able to write the raw `gather`, because when a variant comes up that `take_along_dim` doesn't cover, you need to know what it's doing under the hood.
+
+Let's prove all of this against an oracle — the slow, obviously-correct loop that transcribes "for each query, for each of its top picks, copy that candidate's vector," which is the specification `gather` is a fast version of:
+
+```{python}
+def pick_reference(candidates, idx):
+    """Oracle: literally copy candidates[q, idx[q,r]] for each query q, rank r.
+    Uses new_empty so the output inherits candidates' dtype and device rather than
+    silently defaulting to CPU float32. This is a SEMANTIC oracle, not an
+    implementation: on CUDA the loop would issue a swarm of tiny indexing and copy
+    operations from Python (and any version that turns device indices into Python
+    scalars would also force synchronization). It exists to pin down meaning."""
+    Q, R = idx.shape
+    out = candidates.new_empty(Q, R, candidates.shape[-1])
+    for q in range(Q):
+        for r in range(R):
+            out[q, r] = candidates[q, idx[q, r]]
+    return out
+
+torch.testing.assert_close(picked, pick_reference(candidates, top_idx))
+print("gather == the loop it replaces  ✓")
+```
+
+## The intuition: gather is a one-hot matmul without the matrix
+
+If the formula tells you *what* `gather` does, this tells you *why* it's the right primitive — why it's fast, why it's differentiable, why it shows up everywhere. Selecting element `index[i]` from a vector is the same as taking a dot product with a one-hot vector that has its 1 at position `index[i]`:
+
+```{python}
+import torch.nn.functional as F
+
+labels = torch.tensor([2, 0, 1, 2, 0])       # 5 items, each pointing at one of 3 rows
+table  = torch.tensor([[10., 11.],           # a 3-row lookup table
+                       [20., 21.],
+                       [30., 31.]])
+
+# "look up each item's row" two ways: index directly, or multiply by a one-hot matrix
+onehot = F.one_hot(labels, num_classes=3).float()
+print("one-hot rows for labels", labels.tolist(), ":")
+print(onehot.int())
+```
+
+Multiply a one-hot matrix by a table and you *select* rows of that table — that's a lookup:
+
+```{python}
+via_index  = table[labels]        # index each item's row directly
+via_onehot = onehot @ table       # ...or select it with a one-hot matmul
+print("table[labels] == onehot @ table?", torch.equal(via_index, via_onehot))
+```
+
+And multiply the *transpose* of a one-hot matrix by a vector of values and you *scatter-add* those values into bins — that's the reverse, transpose-like direction:
+
+```{python}
+values = torch.tensor([1., 2., 3., 4., 5.])       # one value per item
+via_matmul  = onehot.T @ values                    # bin by label, via matmul
+via_scatter = torch.zeros(3).scatter_add_(0, labels, values)
+print("one-hotᵀ @ values :", via_matmul.tolist())
+print("scatter_add       :", via_scatter.tolist())
+print("same?", torch.allclose(via_matmul, via_scatter))
+```
+
+Label 0 collected items 1 and 4 (`2 + 5 = 7`), label 1 got item 2 (`3`), label 2 got items 0 and 3 (`1 + 4 = 5`). This is the single most useful thing to carry from this post: **`gather` selects, `scatter_add` bins, and both are the one-hot matmul with the matrix elided** — which is why gradients flow cleanly to the *selected or scattered values* (a matmul is differentiable — though the integer indices themselves are discrete coordinates and carry no gradient), and why the same two operations power embedding lookups, mixture-of-experts routing, and every "sum by group" aggregation you'll ever write. The point of eliding the matrix is that `gather` performs the requested indexed reads directly, without ever materializing the enormous, mostly-zero one-hot selection matrix — a real saving in both memory and work, though the exact kernel behaviour is PyTorch's to decide, not something to pin to a specific big-O.
+
+## The trap that has nothing to do with gather: copies versus views
+
+Before scatter, a detour into a bug you *will* hit, because it lives in the indexing syntax itself and it's silent. Recall from the strides post that a basic slice returns a **view** (shares memory), while indexing with a list or tensor — "advanced indexing" — returns a **copy**. That distinction is harmless for reads. For *writes*, it's a trap, and the trap has three separate questions hiding inside it that people conflate.
+
+**Question 1: what does a read return — a view or a copy?**
+
+```{python}
+t = torch.arange(10.)
+sliced   = t[2:5]         # basic slice     -> VIEW (shares t's memory)
+advanced = t[[2, 3, 4]]   # list index      -> COPY
+
+sliced[0]   = 999.        # write into the view
+advanced[1] = -999.       # write into the copy
+
+print("t =", t.tolist())
+print("writing to the slice reached t?         ", 999.  in t.tolist())
+print("writing to the stored advanced index?   ", -999. in t.tolist(), " <- went nowhere")
+```
+
+That's the slogan everyone learns, and for reads it's the end of the story. But watch what happens when the indexing sits on the *left* of an assignment.
+
+**Question 2: does assignment *through* the index write back? Yes — even `+=`.**
+
+```{python}
+t2 = torch.arange(10.)
+t2[[2, 3, 4]] += 1                         # augmented assignment THROUGH the index
+print("t2[[2,3,4]] += 1 :", t2.tolist())
+
+t3 = torch.arange(10.)
+t3[[2, 3, 4]] = torch.tensor([-1., -2., -3.])
+print("t3[[2,3,4]] = v  :", t3.tolist())
+```
+
+`t2[[2,3,4]] += 1` **did** update `t2`, even though `t2[[2,3,4]]` on its own returns a copy. The reason is that indexed augmented assignment is a *read-modify-write whose final step assigns back through the original indexing target*: it reads (producing the throwaway copy), adds, and then writes through the subscript. The copy is scratch; the write lands.
+
+So the rule that actually holds is not "advanced indexing doesn't write." It's: **assignment through the subscript writes; mutating a value you read out and stored does not.** `emb[ids] = new` updates `emb`. `rows = emb[ids]; rows[0] = new` updates nothing — `rows` is a detached copy. I have watched this exact confusion cost someone a morning: a training loop that "reset" some embedding rows by pulling them out, zeroing the pulled-out copy, and wondering why the embeddings never changed.
+
+**Question 3: what happens when indices collide?**
+
+```{python}
+dst   = torch.zeros(3)
+dup   = torch.tensor([0, 0])        # position 0, twice
+delta = torch.tensor([1., 2.])
+
+dst[dup] += delta
+print("dst[dup] += [1,2] :", dst.tolist(), " <- NOT a sum; do not rely on this value")
+
+dst2 = torch.zeros(3)
+dst2.index_add_(0, dup, delta)
+print("index_add_(0,dup) :", dst2.tolist(), " <- accumulates: 1 + 2 = 3")
+```
+
+With duplicate indices, `dst[dup] += delta` computes both increments against the *original* value and then writes them to the same slot — so this is **not an accumulation contract**. On this CPU run one value happened to land, but PyTorch documents duplicate destinations under non-accumulating indexed assignment as *undefined*, and on CUDA the result can be nondeterministic. The lesson is not "one write wins" (that's reading a policy into an accident); it's that if you mean "accumulate," you must say so explicitly with `index_add_` or `scatter_add_`. Collision policy is part of your program's contract; `+=` leaves it undefined.
+
+Three questions — *read returns what? assignment writes back? collisions accumulate?* — with three different answers, and conflating them is how the "advanced indexing is a copy" slogan turns into a real bug.
+
+## scatter: writing where gather reads
+
+With the one-hot-matmul picture in hand, `scatter` needs almost no new machinery — it *reverses the direction* of `gather`'s coordinate map, *writing* values into indexed positions instead of reading them out. (It's tempting to call it gather's "inverse," and it is exactly that for a collision-free permutation — but only then: a gather can read the same source twice or skip sources entirely, and a map like that has no true inverse. "Reverses the direction of the coordinate map" is the honest description.) Same one rule, mirrored: for a 2-D case with `dim=1`, `self[i, index[i,j]] = src[i,j]` (in 3-D it reads `self[i, index[i,j,k], k] = src[i,j,k]` — the index still replaces only the `dim` coordinate). Two uses cover almost everything you'll do with it:
+
+```{python}
+labels = torch.tensor([2, 0, 1, 2])
+
+# 1. one-hot encoding: place a 1 at each label's column
+onehot = torch.zeros(4, 3).scatter_(1, labels.unsqueeze(1), 1.0)
+print("one-hot:", onehot.int().tolist())
+print("matches F.one_hot?", torch.equal(onehot, F.one_hot(labels, 3).float()))
+```
+
+```{python}
+# 2. scatter_add: the binning operation from the intuition section
+counts = torch.zeros(3).scatter_add_(0, labels, torch.ones(4))
+print("count per label:", counts.tolist(), "(label2 appears twice)")
+```
+
+`scatter_add_` is the one to remember, because it's how you aggregate variable-sized groups with no loop: mixture-of-experts combining expert outputs, graph neural networks summing over each node's neighbours, any "reduce by key." (NumPy's equivalent is the slightly awkward `np.add.at(dst, idx, src)`, or `np.bincount` for the counting special case — worth knowing if you cross between the libraries.)
+
+## A coordinate grid, and the argument that transposes it
+
+One more indexing tool, because you'll need it constantly and it has a trap of its own. To build a grid of coordinates — for positional encodings, for sampling, for any "where is each pixel" computation — you use `meshgrid`, and its one argument decides whether your coordinate system is right-side up:
+
+```{python}
+H, W = 3, 5
+ii, jj = torch.meshgrid(torch.arange(H), torch.arange(W), indexing='ij')
+ij_grid = torch.stack([ii, jj], dim=-1)
+print("indexing='ij' -> shape", tuple(ij_grid.shape), "| ij_grid[1,3] =", ij_grid[1, 3].tolist())
+```
+
+`'ij'` is the matrix convention: the first output index runs down rows, so `grid[1, 3]` is genuinely row 1, column 3. Pass `indexing='xy'` instead and the first two axes swap — you'd get shape `(5, 3, 2)` and a silently transposed coordinate system. PyTorch has *warned* on the omitted argument since version 1.10 (the current default is `'ij'`, and the warning text says it will be required in a future release), so pass it always, as though it already were — coordinate convention is part of your function's contract, and the years of transposed-grid bugs that motivated the warning all came from letting the default decide.
+
+There's a sting in the tail worth knowing: `F.grid_sample`, the op you're most likely to *build* a grid for, disagrees with the grid you just naturally constructed on almost every convention. Its contract is worth spelling out, because "I made a coordinate grid" is nowhere near enough:
+
+- coordinates in **`(x, y)` order** — the opposite of the `(row, col)` you'd write;
+- **normalized to `[-1, 1]`**, not pixel indices;
+- shape **`(N, H_out, W_out, 2)`** — a batch dimension it will not infer for you;
+- an explicit **`align_corners`** choice, which changes what `-1` and `+1` *mean* geometrically;
+- plus `mode` (interpolation) and `padding_mode` for out-of-range samples.
+
+The way to be sure you've got all five right is a test that should come back matching within floating-point tolerance — sample an image on a grid that ought to reproduce it:
+
+```{python}
+import torch.nn.functional as F
+
+def identity_grid(N, H, W, *, device=None, dtype=torch.float32):
+    """A grid that makes grid_sample return its input unchanged, with align_corners=True.
+    Requires H, W >= 2: with align_corners=True the normalized coordinate maps across
+    (size - 1) intervals, which is degenerate at size 1 — PyTorch documents that case
+    as ill-defined, so we refuse it rather than rely on whatever the kernel happens to do."""
+    if H < 2 or W < 2:
+        raise ValueError(f"align_corners=True identity grid needs H, W >= 2; got {H}x{W}")
+    ys = torch.linspace(-1, 1, H, device=device, dtype=dtype)
+    xs = torch.linspace(-1, 1, W, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+    return torch.stack((xx, yy), dim=-1).expand(N, -1, -1, -1)   # (x, y), NOT (row, col)
+
+img         = torch.randn(1, 3, 5, 7)
+sample_grid = identity_grid(1, 5, 7, device=img.device, dtype=img.dtype)
+print("sample_grid shape:", tuple(sample_grid.shape), "(N, H_out, W_out, 2)")
+
+same = F.grid_sample(img, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+torch.testing.assert_close(same, img, atol=1e-5, rtol=1e-5)     # assert, don't just print
+print("align_corners=True  -> identity test passed")
+
+drift = F.grid_sample(img, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+print("align_corners=False -> identity?", torch.allclose(drift, img, atol=1e-5),
+      "| max abs diff:", round((drift - img).abs().max().item(), 3))
+```
+
+The last line is the point. The *same* grid and the *same* image, with only `align_corners` flipped, and the output is no longer the input at all — off by a substantial margin (the exact figure depends on the random image, but it is nowhere near tolerance). That flag decides whether `-1` and `+1` refer to the *centres* of the corner pixels or their outer *edges*, which shifts every sample by half a pixel. It's the single most common cause of "my warp is subtly blurry / my model degraded after I refactored the resize," and an identity test like this catches it in one line.
+
+And, tying back to the strides post: `meshgrid` is just sugar over two broadcast `arange`s, which is what makes it stop being magic —
+
+```{python}
+i = torch.arange(H).view(H, 1).expand(H, W)   # row index, broadcast across columns
+j = torch.arange(W).view(1, W).expand(H, W)   # column index, broadcast down rows
+broadcast_grid = torch.stack([i, j], dim=-1)
+assert torch.equal(broadcast_grid, ij_grid)                     # assert, don't just print
+print("pure broadcast reproduces meshgrid('ij')  ✓")
+```
+
+## A parting trap: these APIs are not interchangeable
+
+Throughout this post the different selection tools have looked like variations on one theme, and mostly they are — but they disagree in ways that will bite if you assume they're drop-in substitutes. The sharpest example: advanced indexing wraps negative indices Python-style, while `gather` treats them as genuinely out of bounds and raises.
+
+```{python}
+x = torch.arange(5)
+print("advanced index x[[-1]] :", x[torch.tensor([-1])].item(), "(wraps to the last element)")
+```
+
+```{python}
+#| error: true
+torch.gather(x, dim=0, index=torch.tensor([-1]))   # gather does NOT wrap
+```
+
+Same conceptual operation, opposite handling of a negative index — which is exactly why "just use whichever indexing API" is a dangerous habit. A negative index that silently wraps in one path and crashes in another is the kind of divergence that turns a refactor into a debugging session. It's worth knowing the rough division of labour so you reach for the right tool deliberately: `index_select` takes a 1-D index and pulls *whole slices* along one axis (the same indices for every other coordinate); `gather`/`take_along_dim` take a same-rank index and select *per-coordinate* along one axis; advanced indexing handles arbitrary coordinate combinations; and for writing, `scatter_`/`index_add_`/`scatter_add_`/`scatter_reduce_` cover unique destinations, summation, and general reductions respectively.
+
+
+
+Selection-by-index looks like a grab-bag of operations you memorize separately. It isn't — it's two operations and their shared idea:
+
+- **`gather` reads, `scatter` writes**, and both obey one rule: the index replaces the coordinate along one axis while every other coordinate passes through — hence the same-rank requirement that trips everyone up. (`gather` returns an output shaped like the index; `scatter` performs one write per index coordinate into a destination whose own shape is fixed separately.)
+- Underneath, both are **one-hot matrix multiplies with the matrix elided** — which is the intuition that explains why they're fast, differentiable, and everywhere, and why `scatter_add` is the natural "sum by group."
+- The **copy-versus-view** distinction is a separate trap: assignment *through* an index writes back (including `+=`), but mutating a value you read out and stored does not — and duplicate indices need an explicit `index_add_` if you mean to accumulate.
+
+If one sentence survives: *`gather` and `scatter` are how you select and place by index; algebraically they're sparse one-hot selection and placement maps with the matrix never built, and the shape rules that seem arbitrary are exactly what that correspondence requires.*
+
+## Where this goes next
+
+We've now moved data around by shape (strides), combined it across axes (broadcasting), and selected it by index (here) — all of it exact, none of it worrying about the actual numbers involved. The next post is where the numbers bite back: floating-point arithmetic is not real arithmetic, and the textbook formula for softmax, for a distance, for a masked sum can be provably correct on paper and catastrophically wrong in `fp32`.
+
+## References
+
+- [`torch.gather`](https://pytorch.org/docs/stable/generated/torch.gather.html) — read the formula in the docs once, out loud; it is the entire operation.
+- [`torch.take_along_dim`](https://pytorch.org/docs/stable/generated/torch.take_along_dim.html) — selection along one dimension using a long index, designed for the indices that `sort`, `argsort`, `topk` and friends hand back. Underused; reach for it first.
+- [`torch.Tensor.scatter_add_`](https://pytorch.org/docs/stable/generated/torch.Tensor.scatter_add_.html) and [`torch.Tensor.index_add_`](https://pytorch.org/docs/stable/generated/torch.Tensor.index_add_.html) — the explicit collision-accumulation policies.
+- [`torch.meshgrid`](https://pytorch.org/docs/stable/generated/torch.meshgrid.html) — and the `indexing=` argument you should always pass.
+- The basic-vs-advanced indexing view/copy rule is inherited from NumPy; the [NumPy indexing docs](https://numpy.org/doc/stable/user/basics.indexing.html) explain it more directly than PyTorch's, and `np.take_along_axis` / `np.put_along_axis` / `np.add.at` are the direct analogues of the operations here.
