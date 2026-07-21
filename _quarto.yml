@@ -6,7 +6,7 @@ project:
 website:
   description: "A blog built with Quarto"
   site-url: https://maitreyasuin.github.io/blog
-  title: "Maitreya - Notes"
+  title: "Maitreya - AI Notes"
   favicon: favicon.svg
   open-graph: true
   twitter-card: true
