@@ -514,21 +514,6 @@ An agent is a while loop that lets a model call functions. Forty lines, and each
 
 If one sentence survives: *a minimal tool-using agent is a loop that lets a model request actions and consume their observations — the loop is trivial, the failure modes are everything, and that's why the interesting work is almost never in the loop itself.*
 
-## Where this series goes
-
-Six posts, each built on the failures of the last. Same rules as always: every code example runs, behavioural claims carry assertions, external claims are cited or measured — and the scripted-model trick keeps it all assertable and API-key-free until we deliberately need a real model.
-
-| # | Post | What it's about |
-|---|---|---|
-| **1** | **The agent loop** *(this one)* | The while loop, and the four ways it breaks |
-| 2 | **Tools are an API for a careless caller** | Schemas, validation, idempotency, and why tool descriptions are prompts. The model is an untrusted client that read your docs once |
-| 3 | **Context and memory** | Failure #4 head-on: summarization, retrieval, scratchpads, and structured state. When to compress and what it costs you |
-| 4 | **Planning: ReAct, decomposition, and reflection** | Does thinking-before-acting help, and when does it just burn tokens? Building a plan-then-execute agent and measuring it against the reactive loop |
-| 5 | **Evaluating agents** | The hardest post. Trajectory vs outcome scoring, why unit tests don't transfer, building a small deterministic benchmark, and what "82% success" is hiding |
-| 6 | **MCP: tools as infrastructure** | Writing a server, the transport, and what standardizing the tool interface actually changes about system design |
-
-Post 2 next: the tools themselves, where the interesting failures move from the loop into the interface between the model and your code.
-
 ## References
 
 - Yao et al., [*ReAct: Synergizing Reasoning and Acting in Language Models*](https://arxiv.org/abs/2210.03629), 2022 — the interleaved thought/action/observation pattern this loop implements.
