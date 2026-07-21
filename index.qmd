@@ -17,10 +17,6 @@ listing:
 ::: {.site-total-views id="site-total-views"}
 :::
 
-::: {.site-portfolio-link}
-[Portfolio →](https://maitreyasuin.github.io)
-:::
-
 <script>
 (function () {
   if (localStorage.getItem('showViewCounts') !== '1') return;
