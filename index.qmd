@@ -30,7 +30,17 @@ listing:
 
 ::: {.g-col-12 .g-col-md-6 .home-card}
 ### 🧮 [Foundations](fundamentals.qmd)
-Tensors, optimization, classical ML, training loops and architectures - the building blocks behind modern AI systems.
+Tensors, optimization, classical ML, and training loops - the building blocks behind modern AI systems.
+:::
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### 🤖 [Agentic AI](agentic.qmd)
+Agents and evals - building things that act, and measuring whether they act well.
+:::
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### 🏗️ [Architectures](architectures.qmd)
+Attention, transformers, and the model architectures everything else is built from.
 :::
 
 ::: {.g-col-12 .g-col-md-6 .home-card}

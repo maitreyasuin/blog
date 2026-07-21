@@ -14,6 +14,8 @@ website:
   navbar:
     left:
       - fundamentals.qmd
+      - agentic.qmd
+      - architectures.qmd
       - llm-systems.qmd
     right:
       - about.qmd

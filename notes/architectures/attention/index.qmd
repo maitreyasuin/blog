@@ -1,0 +1,17 @@
+---
+title: "👁️ Attention"
+listing-page: true
+listing:
+  contents: .
+  type: default
+  sort: "date desc"
+  sort-ui: false
+  filter-ui: false
+  fields: [image, date, title, depth, description, categories]
+  field-display-names:
+    depth: "Depth"
+page-layout: full
+title-block-banner: true
+---
+
+Scaled dot-product attention, multi-head splits, cross-attention, and masking — derived from one idea instead of memorized as a formula.

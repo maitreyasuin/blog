@@ -1,0 +1,537 @@
+---
+title: "The Agent Loop: Forty Lines and Four Ways It Breaks"
+description: "Strip away the frameworks and a minimal tool-using agent is a loop that lets a language model request actions. Build that loop from scratch, then break it deliberately — because many of the recurring engineering problems become visible as failure modes of these forty lines."
+categories: [agents]
+date: 2026-07-20
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+Ask what an "AI agent" is and you'll get an architecture diagram. Ask what one *does* and the answer is smaller than the diagrams suggest:
+
+> **A minimal tool-using agent is a loop that lets a language model request actions, executes the approved ones, returns the results as observations, and repeats until it terminates.** If the model emits a final answer, stop; if it requests an action, run it and paste the result back; otherwise tell it the protocol and let it retry. That's the whole mechanism. Everything else — planning, memory, orchestration, tool schemas — is engineering built on top of, or around the failures of, that loop.
+>
+> "Minimal" and "tool-using" are doing work in that sentence. Agents also act through browsers, message queues, long-running jobs, and human approval steps, and a "tool" in production is rarely a local function. But the loop below is the irreducible core, and it's easier to see what the elaborate versions are *for* once you've watched this one break.
+
+This post builds the loop in about forty lines, then breaks it four ways. The breaking is the point: each failure mode below has an entire subfield attached to it, and it's much easier to understand why those subfields exist once you've watched the naive version fall over.
+
+**One design decision worth stating up front, because it shapes everything here:** this post uses a *scripted* model rather than a real API. Every "model reply" is a fixed string. That makes the whole thing deterministic, free, offline, and — most importantly — **assertable**. Many agent tutorials depend on a live API, which makes deterministic regression tests hard and leaves their failure discussions as anecdotes. Ours run.
+
+> **TL;DR** — The loop is: send the transcript, parse a tool call out of the reply, execute it, append the result, repeat until the model answers or you run out of steps. The four things that break it are *no termination* (fix: a step budget you actually enforce), *hallucinated tools* (fix: validate the name and return the error as an observation), *malformed output* (fix: never let a parse failure escape the loop), and *unbounded context* (no clean fix — it's the reason the next post exists).
+
+## Build it
+
+Three pieces: some tools, a model, and the loop that connects them.
+
+**The tools**, in this offline demo, are ordinary Python functions. In production that callable is usually an adapter over an API, a database, a browser, a job queue, or an action requiring human approval — the loop doesn't care, but the safety properties differ enormously, which is the subject of the next post.
+
+```{python}
+def add(a: float, b: float) -> float:
+    """Add two numbers."""
+    return a + b
+
+def lookup_population(city: str) -> int:
+    """Population of a city, from a small fixed table."""
+    table = {"paris": 2_100_000, "lagos": 15_400_000, "lima": 9_700_000}
+    key = city.strip().lower()
+    if key not in table:
+        raise KeyError(f"no population on file for {city!r}")
+    return table[key]
+
+TOOLS = {"add": add, "lookup_population": lookup_population}
+```
+
+::: {.callout-warning}
+## The allowlist is not validation
+
+`TOOLS` stops the model calling a tool that doesn't exist. It does nothing about a tool called *badly* — Python's annotations are documentation, not enforcement:
+
+```{python}
+print(f'add(a="x", b="y") = {add(a="x", b="y")!r}')
+```
+
+String concatenation, no error, and a plausible-looking observation goes straight back into the transcript. **The model is an untrusted caller.** Schema validation, type and range checks, authorization, confirmation for consequential actions, timeouts and cost limits all belong at the tool boundary, and none of them are here. That's deliberate — it's the whole of the next post.
+:::
+
+**The model** is where a real system would call an API. We use a scripted stand-in that returns pre-written replies in order:
+
+```{python}
+class ScriptedModel:
+    """Stands in for an LLM. Returns fixed replies in sequence.
+    Deterministic and offline, which is what lets this post assert things."""
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.transcripts_seen = []
+
+    def __call__(self, transcript):
+        self.transcripts_seen.append(transcript)
+        if not self.replies:
+            raise RuntimeError("the script ran out of replies")
+        return self.replies.pop(0)
+```
+
+The loop below can keep this exact callable abstraction with a real model behind it — though a production adapter carries a great deal more (message roles, schemas, auth, retries, timeouts, streaming, usage accounting, refusals, provider errors). Still, it's worth noticing: *the loop has no dependency on the model being intelligent.* It's plumbing.
+
+**The protocol.** The model has to signal intent in text, so we agree on a format: a line starting `ACTION:` followed by a tool name and JSON arguments, or a line starting `ANSWER:` to finish. (Production APIs may offer strict schema-constrained tool calls, which can remove the malformed-JSON and schema-shape part of the failure mode below — though not whether the model picked the right tool, supplied sensible values, or requested something safe. It's worth seeing the raw version first to understand exactly what that feature is and isn't buying you.)
+
+The protocol is deliberately naive: **one single-line action per reply, tool names matching `\w+`, and `ANSWER` checked before `ACTION`.** It doesn't handle multi-line JSON (which comes back as "no action found" rather than a parse error), hyphenated tool names, several calls in one reply, or a reply containing *both* an answer and an action — in that last case the answer silently wins and the action is dropped. Those are protocol decisions; a production system makes them explicitly, or sidesteps them with structured tool-calling.
+
+```{python}
+import json, re
+
+def parse_action(text):
+    """Find an ACTION line. Returns (tool_name, kwargs), or None if there isn't one."""
+    match = re.search(r"^ACTION:\s*(\w+)\s*(\{.*\})\s*$", text, re.MULTILINE)
+    if match is None:
+        return None
+    return match.group(1), json.loads(match.group(2))
+
+def parse_answer(text):
+    """Find an ANSWER line anywhere in the reply. Returns the answer, or None.
+
+    Searching rather than checking the prefix matters: models routinely emit
+    'THOUGHT: ...' before 'ANSWER: ...', and a startswith() check silently
+    misses those, so the agent never terminates. (I wrote the startswith
+    version first. The assertion in the next cell is what caught it.)"""
+    match = re.search(r"^ANSWER:\s*(.*)$", text, re.MULTILINE)
+    return match.group(1).strip() if match else None
+```
+
+**And the loop:**
+
+```{python}
+def run_agent(model, question, tools, max_steps=6):
+    """The whole thing. Returns (answer_or_None, transcript)."""
+    transcript = [f"QUESTION: {question}"]
+
+    for step in range(max_steps):
+        reply = model("\n".join(transcript))       # 1. show the model everything so far
+        transcript.append(reply)
+
+        answer = parse_answer(reply)               # 2. done?
+        if answer is not None:
+            return answer, transcript
+
+        action = parse_action(reply)               # 3. did it ask for a tool?
+        if action is None:
+            transcript.append("OBSERVATION: no ACTION or ANSWER found; reply with one.")
+            continue
+
+        name, kwargs = action
+        if name not in tools:                      # 4. is that tool real?
+            transcript.append(f"OBSERVATION: error: no tool named {name!r}. "
+                              f"Available: {sorted(tools)}")
+            continue
+
+        try:                                       # 5. run it, and never let it kill the loop
+            result = tools[name](**kwargs)
+            transcript.append(f"OBSERVATION: {result}")
+        except Exception as e:
+            transcript.append(f"OBSERVATION: error: {type(e).__name__}: {e}")
+
+    return None, transcript                        # 6. budget exhausted
+```
+
+Six numbered steps, and every one of them is load-bearing in a way we're about to demonstrate. Run it:
+
+```{python}
+model = ScriptedModel([
+    'THOUGHT: I need Paris first.\nACTION: lookup_population {"city": "Paris"}',
+    'THOUGHT: Now Lima.\nACTION: lookup_population {"city": "Lima"}',
+    'THOUGHT: 2100000 + 9700000 = 11800000.\nANSWER: 11800000',
+])
+
+answer, transcript = run_agent(model, "Combined population of Paris and Lima?", TOOLS)
+assert answer == "11800000"
+print(f"answer: {answer}   (in {len(model.transcripts_seen)} model calls)")
+print("\n--- transcript ---")
+print("\n".join(transcript))
+```
+
+That's an agent. It decomposed a question, called a tool twice, and combined the results. No framework, no orchestration layer, ~40 lines.
+
+The thing to notice is that **the model call is stateless** — no variables, nothing carried between turns. Every turn it receives the conversation from scratch. In this minimal implementation the `transcript` list is the model's entire explicit working memory, and the loop's central job is deciding what gets appended to it. (A real system holds plenty of state the model never sees directly: tools and their environment, orchestration policy, external stores, session data. But everything the model *reasons over* has to be reconstructed from what you send each turn.) Hold that thought; it's the fourth failure mode.
+
+## Break it #1: no termination
+
+The `max_steps` argument looks like defensive boilerplate. Remove it and you have an infinite loop with a billing account attached.
+
+```{python}
+stubborn = ScriptedModel(['ACTION: add {"a": 1, "b": 1}'] * 50)
+answer, transcript = run_agent(stubborn, "Loop forever", TOOLS, max_steps=4)
+
+assert answer is None
+print(f"returned {answer} after {len(stubborn.transcripts_seen)} model calls (budget was 4)")
+```
+
+A model that never emits `ANSWER:` will call tools until something stops it. Real ones do this: they get stuck re-checking a fact, or alternate between two tools each of which makes the other look necessary. **The step budget isn't a safety net, it's part of the algorithm** — an agent without a termination condition isn't an agent, it's a runaway process.
+
+Notice also *what* the loop returns: `None`, not a wrong answer. Distinguishing "I couldn't" from "here's my best guess" matters more in agent systems than almost anywhere else, because a caller that can't tell them apart will act on a fabrication.
+
+`None` is still too coarse for production, though — it collapses "ran out of steps," "the model API failed," "a tool timed out," "the user cancelled," and "policy denied the action" into one value, and those want different handling upstream. The fix is a status enum rather than a sentinel:
+
+```{python}
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+class AgentStatus(str, Enum):
+    ANSWERED              = "answered"
+    STEP_BUDGET_EXHAUSTED = "step_budget_exhausted"
+    MODEL_UNAVAILABLE     = "model_unavailable"
+    CANCELLED             = "cancelled"
+    POLICY_DENIED         = "policy_denied"
+
+@dataclass
+class AgentResult:
+    status: AgentStatus
+    answer: Optional[str]
+    steps: int
+    transcript: list[str] = field(default_factory=list)
+
+print(AgentResult(AgentStatus.STEP_BUDGET_EXHAUSTED, None, 4))
+```
+
+An actual enum rather than a bare `str`, because a status field typed `str` accepts `"banana"` and the whole point is that callers can branch on it reliably.
+
+Real termination conditions go well beyond a step count, too: a wall-clock deadline, a token or cost budget, repeated-action detection, user cancellation, or too many consecutive failures.
+
+Making that concrete needs one more piece — the failure taxonomy from the next section — so the assembled version appears there.
+
+## Break it #2: tools that don't exist
+
+Models invent tools. They've read a lot of code and will confidently call `get_weather` because it's the sort of thing that ought to exist.
+
+```{python}
+confused = ScriptedModel([
+    'ACTION: get_weather {"city": "Paris"}',
+    'THOUGHT: That tool is not available. I should use what I have.\n'
+    'ACTION: lookup_population {"city": "Paris"}',
+    'ANSWER: 2100000',
+])
+
+answer, transcript = run_agent(confused, "Tell me about Paris", TOOLS)
+print([line for line in transcript if line.startswith("OBSERVATION")][0])
+print(f"\nrecovered? answer = {answer}")
+assert answer == "2100000"
+```
+
+The key move is in step 4 of the loop: an unknown tool doesn't raise, it produces an **observation** — and one that lists what's actually available. The model reads that on the next turn and corrects itself.
+
+That's a pattern worth naming: for the failures the model *can* fix, an observation beats an exception. A stack trace terminates the program; an observation gives the model a chance to try something else — so those error messages should be written *for a reader who will act on them*: say what went wrong, and say what the valid options are. (Which failures qualify is a question with a sharper answer than "all of them," and we'll get to it two sections down.)
+
+The same applies when a real tool fails:
+
+```{python}
+recovering = ScriptedModel([
+    'ACTION: lookup_population {"city": "Atlantis"}',
+    'THOUGHT: Not in the table. Trying Lagos instead.\n'
+    'ACTION: lookup_population {"city": "Lagos"}',
+    'ANSWER: 15400000',
+])
+
+answer, transcript = run_agent(recovering, "Atlantis, or Lagos if unavailable?", TOOLS)
+print([line for line in transcript if line.startswith("OBSERVATION")][0])
+assert answer == "15400000"
+print("recovered from a raised exception  ✓")
+```
+
+`lookup_population` raised a `KeyError`. The loop caught it, turned it into text, and the model routed around it. Step 5's `try/except` is doing real work.
+
+## Break it #3: output that doesn't parse — and the bug I shipped
+
+Sometimes the model just talks. No `ACTION:`, no `ANSWER:`, just prose. The loop handles that (step 3):
+
+```{python}
+chatty = ScriptedModel([
+    "I think the combined population is probably around 12 million.",
+    'ANSWER: 11800000',
+])
+answer, transcript = run_agent(chatty, "Population?", TOOLS)
+print([line for line in transcript if line.startswith("OBSERVATION")][0])
+assert answer == "11800000"
+print("nudged back on protocol  ✓")
+```
+
+But here is a case the loop above gets **wrong**, and I only found it because I was writing assertions rather than prose:
+
+```{python}
+#| error: true
+broken_json = ScriptedModel(['ACTION: add {"a": 1, "b":}', 'ANSWER: unreachable'])
+run_agent(broken_json, "add one and one", TOOLS)
+```
+
+The loop carefully wraps *tool execution* in `try/except` and leaves *parsing* unprotected. A model emitting an `ACTION:` line with malformed JSON — which they do, especially smaller ones, and especially with nested arguments — crashes the agent outright. The failure isn't in the tool; it's in the sentence the model wrote about the tool.
+
+The fix is to treat parse failures exactly like tool failures — as observations, not exceptions:
+
+```{python}
+def parse_action_safely(text):
+    """Returns (name, kwargs), or ('__error__', message) — never raises."""
+    match = re.search(r"^ACTION:\s*(\w+)\s*(\{.*\})\s*$", text, re.MULTILINE)
+    if match is None:
+        return None
+    try:
+        return match.group(1), json.loads(match.group(2))
+    except json.JSONDecodeError as e:
+        return "__error__", f"could not parse arguments as JSON: {e}"
+
+def run_agent_v2(model, question, tools, max_steps=6):
+    transcript = [f"QUESTION: {question}"]
+    for _ in range(max_steps):
+        reply = model("\n".join(transcript))
+        transcript.append(reply)
+        answer = parse_answer(reply)
+        if answer is not None:
+            return answer, transcript
+
+        action = parse_action_safely(reply)
+        if action is None:
+            transcript.append("OBSERVATION: no ACTION or ANSWER found; reply with one.")
+            continue
+        name, payload = action
+        if name == "__error__":
+            transcript.append(f"OBSERVATION: error: {payload}")
+            continue
+        if name not in tools:
+            transcript.append(f"OBSERVATION: error: no tool named {name!r}. "
+                              f"Available: {sorted(tools)}")
+            continue
+        try:
+            transcript.append(f"OBSERVATION: {tools[name](**payload)}")
+        except Exception as e:
+            transcript.append(f"OBSERVATION: error: {type(e).__name__}: {e}")
+    return None, transcript
+```
+
+```{python}
+fixed = ScriptedModel([
+    'ACTION: add {"a": 1, "b":}',
+    'THOUGHT: my JSON was malformed. Retrying.\nACTION: add {"a": 1, "b": 1}',
+    'ANSWER: 2',
+])
+answer, transcript = run_agent_v2(fixed, "add one and one", TOOLS)
+print([line for line in transcript if line.startswith("OBSERVATION")][0][:76])
+assert answer == "2"
+print("\nparse failure became an observation, and the model recovered  ✓")
+```
+
+`run_agent_v2` fixes the parser crash, but it still has a second bug that the next section is about: its `except Exception` around the tool call treats *every* failure — including programmer defects — as model-correctable, and pastes the raw exception text into the transcript.
+
+It's tempting to draw a sweeping rule from this: *nothing inside an agent loop should ever raise.* I wrote that sentence in an earlier draft and it's **wrong, and unsafe as advice.**
+
+The correct rule needs two categories. Some failures are **model-correctable**, and those should become observations: an unknown tool, malformed arguments, a validation failure, missing data, a retryable timeout. The model can read them and try something else, which is what the loop above does.
+
+Others should **not** be handed to the model at all:
+
+- **Programmer bugs** — a `TypeError` in your own adapter is a defect to fix, not a hint for a language model.
+- **Authentication and authorization failures** — retrying isn't the answer, and the message may describe your security posture.
+- **Policy violations and cancellations** — these are decisions, not obstacles to route around.
+- **Resource exhaustion and corrupted state** — continuing makes things worse.
+
+And there's a disclosure hazard cutting across all of them: **raw exception text can contain secrets, internal paths, query fragments, or infrastructure detail**, and pasting it into a transcript puts it in the model's context and possibly in a log or a user-visible answer. Sanitize what crosses that boundary.
+
+So: **agent-visible recovery is a conversation built on ordinary exception handling** — you still catch, you just catch at a boundary, classify, sanitize, and then decide whether the model may retry, a human must approve, or the run must stop.
+
+```{python}
+import inspect
+
+class ToolError(Exception):
+    """An expected, sanitized, model-correctable failure. Tools raise this
+    deliberately for domain failures; nothing else is treated as model-facing."""
+
+def execute_tool(tools, name, kwargs):
+    """Execute one validated tool call.
+
+    Returns the successful result as text.
+    Raises ToolError for sanitized, model-correctable failures.
+    Propagates everything else — the caller decides what those mean."""
+    if name not in tools:
+        raise ToolError(f"Unknown tool {name!r}. Available: {sorted(tools)}")
+    tool = tools[name]
+
+    try:
+        inspect.signature(tool).bind(**kwargs)     # validate the CALL, not the body
+    except TypeError as exc:
+        raise ToolError(f"Invalid arguments for {name!r}.") from exc
+
+    return str(tool(**kwargs))                     # domain failures come back as ToolError
+```
+
+(That `str()` is part of this minimal text protocol. A production tool boundary should keep the structured result along with its source and provenance rather than flattening everything to a string the moment it arrives.)
+
+The `inspect.signature(...).bind(...)` line is doing something specific, and my first version of this got it wrong. I originally wrote `except TypeError: raise ToolError("bad arguments")` around the *call itself* — which cheerfully misclassifies a bug **inside** the tool:
+
+```{python}
+def buggy_tool(x):
+    return 1 + "oops"                              # a defect, not a bad argument
+
+try:
+    execute_tool({"buggy": buggy_tool}, "buggy", {"x": 1})
+except ToolError as e:
+    print(f"classified as model-facing (WRONG): {e}")
+except TypeError as e:
+    print(f"propagates as a bug (correct): {e}")
+```
+
+Binding the signature separates "you called it wrong" — which the model can fix — from "the tool is broken," which it can't and shouldn't be asked to. Tools then declare their own expected failures explicitly:
+
+```{python}
+def lookup_population_v2(city: str) -> int:
+    table = {"paris": 2_100_000, "lagos": 15_400_000, "lima": 9_700_000}
+    key = city.strip().lower()
+    if key not in table:
+        raise ToolError(f"No population on file for {city!r}.")   # deliberate, model-facing
+    return table[key]
+
+try:
+    execute_tool({"pop": lookup_population_v2}, "pop", {"city": "Atlantis"})
+except ToolError as e:
+    print(f"deliberate domain failure -> observation: {e}")
+```
+
+The general rule: **catch a dedicated expected-error type, not arbitrary built-ins raised from anywhere inside the tool.** A real system extends the taxonomy further — timeouts and rate limits as retryable, auth as fatal, cancellation as its own status — but the shape is the point.
+
+Pulling the pieces together, here's the version that actually applies the taxonomy instead of describing it — structured status, classified tool errors, and a boundary around the model call:
+
+```{python}
+class ModelUnavailable(Exception):
+    """A retryable provider failure. Distinct from a bug in our own code."""
+
+def run_agent_v3(model, question, tools, max_steps=6):
+    transcript = [f"QUESTION: {question}"]
+
+    for step in range(max_steps):
+        try:
+            reply = model("\n".join(transcript))
+        except ModelUnavailable:                          # classified: caller may retry
+            # note what does NOT happen: the provider's message never reaches the
+            # transcript. Log it where operators can see it, not where the model can.
+            return AgentResult(AgentStatus.MODEL_UNAVAILABLE, None, step, transcript)
+        # anything else from the model adapter propagates — a defect, or an auth failure
+
+        transcript.append(reply)
+
+        answer = parse_answer(reply)
+        if answer is not None:
+            return AgentResult(AgentStatus.ANSWERED, answer, step + 1, transcript)
+
+        action = parse_action_safely(reply)
+        if action is None:
+            transcript.append("OBSERVATION: no ACTION or ANSWER found; reply with one.")
+            continue
+        name, payload = action
+        if name == "__error__":
+            transcript.append(f"OBSERVATION: error: {payload}")
+            continue
+
+        try:
+            transcript.append(f"OBSERVATION: {execute_tool(tools, name, payload)}")
+        except ToolError as e:                            # model-correctable, sanitized
+            transcript.append(f"OBSERVATION: error: {e}")
+        # every other exception propagates: bug, auth failure, cancellation, exhaustion
+
+    return AgentResult(AgentStatus.STEP_BUDGET_EXHAUSTED, None, max_steps, transcript)
+```
+
+```{python}
+TOOLS_V2 = {"add": add, "lookup_population": lookup_population_v2}
+
+ok = run_agent_v3(ScriptedModel([
+    'ACTION: lookup_population {"city": "Atlantis"}',
+    'THOUGHT: not on file. Trying Lagos.\nACTION: lookup_population {"city": "Lagos"}',
+    'ANSWER: 15400000',
+]), "Atlantis, else Lagos?", TOOLS_V2)
+assert ok.status is AgentStatus.ANSWERED and ok.answer == "15400000"
+print(f"recovered from a domain failure -> status={ok.status.value!r}, steps={ok.steps}")
+
+out_of_steps = run_agent_v3(ScriptedModel(['ACTION: add {"a": 1, "b": 1}'] * 20),
+                            "loop", TOOLS_V2, max_steps=3)
+assert out_of_steps.status is AgentStatus.STEP_BUDGET_EXHAUSTED and out_of_steps.answer is None
+print(f"budget exhausted        -> status={out_of_steps.status.value!r}")
+
+class Flaky:
+    def __call__(self, transcript):
+        raise ModelUnavailable("provider timeout")
+degraded = run_agent_v3(Flaky(), "anything", TOOLS_V2)
+assert degraded.status is AgentStatus.MODEL_UNAVAILABLE
+print(f"provider failure        -> status={degraded.status.value!r}  (caller can retry, and the provider message stayed out of the transcript)")
+```
+
+Three different failures, three different statuses, and a caller that can tell them apart. That's what the `None` return couldn't do.
+
+What `run_agent_v3` still doesn't do is map the *full* range of model-adapter failures. A real adapter distinguishes timeouts and rate limits (retry with backoff) from authentication failures (fatal, and don't log the message) from cancellation (a decision, not an error) from unexpected defects (propagate). One `ModelUnavailable` class is a placeholder for that taxonomy, not the taxonomy itself.
+
+(This is the argument for structured tool-calling APIs: with strict schema enforcement they move parsing out of your regex and into the provider's constrained decoder, which under the documented conditions removes malformed-JSON and schema-shape failures entirely. What it does *not* remove: the model picking the wrong tool, supplying well-typed but factually wrong values, refusing, or requesting something unsafe. A syntax guarantee, not a semantics one.)
+
+::: {.callout-warning}
+## Tool output is untrusted input
+
+`transcript.append(f"OBSERVATION: {result}")` takes whatever a tool returned and puts it directly into the model's context. Approving a *tool* does not make its *output* trustworthy: a web fetch can return text engineered to look like instructions, a database can return a secret, a search can return something adversarial, and any of them can return enough text to blow the context budget on its own.
+
+Treat observations as **data, not instructions**: keep source and type metadata, cap output size, keep retrieved content visibly separate from your own directives, and never let a tool result redefine what the agent is allowed to do. Prompt injection gets a proper treatment later in the series, but the boundary exists from the very first loop.
+:::
+
+## Break it #4: the transcript that never stops growing
+
+The last failure has no clean fix, which is why it gets a whole post of its own later.
+
+```{python}
+model = ScriptedModel([
+    'ACTION: lookup_population {"city": "Paris"}',
+    'ACTION: lookup_population {"city": "Lima"}',
+    'ACTION: lookup_population {"city": "Lagos"}',
+    'ANSWER: 27200000',
+])
+_, transcript = run_agent(model, "Total population of Paris, Lima and Lagos?", TOOLS)
+
+for i, seen in enumerate(model.transcripts_seen):
+    print(f"model call {i}: {len(seen):5d} chars, {len(seen.splitlines())} lines")
+```
+
+Every turn, the model conditions on the history it's given. With a stateless API and no prefix reuse, that means resending it — though prompt/KV caching and provider-managed conversation state can avoid recomputing the whole prefix, so this is a property of the default arrangement rather than an inescapable law. It produces three compounding problems:
+
+- **Per-call context grows linearly; cumulative uncached input-token volume grows quadratically.** If each step appends roughly a constant amount, turn *n* sends about *n* units — linear. The *total* sent across a run is `c + 2c + … + nc`, i.e. `O(n²)`. That's a statement about **token volume**, not a universal latency or compute law: attention over a length-`L` prompt has its own roughly quadratic cost, prefix and KV caching can eliminate much of the resending, batching and provider-side state change the picture again, and billing has its own rules. What survives all of it is that the context *window* bounds what you can send at all.
+- **The context window is a hard wall.** Long tasks hit it and something has to be dropped. What you drop determines what the agent forgets.
+- **A full context isn't a healthy one.** Long-context evaluations have repeatedly found models using information less reliably when it sits in the middle of a long input than near either end — though how strongly depends on the model, task, and prompt.
+
+Summarization, retrieval, scratchpads, structured state outside the transcript — these all address this growth-and-relevance problem, though "agent memory" also covers things this graph doesn't, like cross-session persistence and provenance. That's the next post.
+
+## What to carry away
+
+An agent is a while loop that lets a model call functions. Forty lines, and each failure mode is a subfield.
+
+- **The model call in this implementation is stateless**, so its explicit working state has to be reconstructed each turn from the transcript and whatever external context you supply. (Provider-managed conversation APIs can hold some of it for you.) Most agent engineering is deciding what gets appended, retained, summarized, or moved out.
+- **Termination is part of the algorithm**, not a safety net — and it needs more than a step budget: wall-clock deadlines, token/cost budgets, repeated-action detection, user cancellation, and consecutive-failure limits all belong there. Return a *structured status* rather than a bare `None`, because "budget exhausted," "model unavailable," and "policy denied" call for different handling by the caller.
+- **Agent-visible recovery is a conversation built on exception handling, not a replacement for it.** Expected, sanitized, model-correctable failures become observations — write those for a reader who will act on them. Bugs, authentication failures, policy denials and cancellations must *not* become model-correctable observations: they terminate the run, return an explicit status, or propagate, according to the caller's policy.
+- **Every failure needs an explicit classification.** Model-correctable failures become sanitized observations; retryable infrastructure failures follow a retry policy; cancellations, authorization failures, policy denials, corrupted state and unexpected bugs terminate or propagate. I shipped a version where malformed JSON escaped while tool exceptions were caught — and then a draft claiming *nothing* should ever raise, which is the opposite error.
+- **Working context grows every step, and cumulative uncached token volume can become quadratic.** No clean fix, only trade-offs.
+
+If one sentence survives: *a minimal tool-using agent is a loop that lets a model request actions and consume their observations — the loop is trivial, the failure modes are everything, and that's why the interesting work is almost never in the loop itself.*
+
+## Where this series goes
+
+Six posts, each built on the failures of the last. Same rules as always: every code example runs, behavioural claims carry assertions, external claims are cited or measured — and the scripted-model trick keeps it all assertable and API-key-free until we deliberately need a real model.
+
+| # | Post | What it's about |
+|---|---|---|
+| **1** | **The agent loop** *(this one)* | The while loop, and the four ways it breaks |
+| 2 | **Tools are an API for a careless caller** | Schemas, validation, idempotency, and why tool descriptions are prompts. The model is an untrusted client that read your docs once |
+| 3 | **Context and memory** | Failure #4 head-on: summarization, retrieval, scratchpads, and structured state. When to compress and what it costs you |
+| 4 | **Planning: ReAct, decomposition, and reflection** | Does thinking-before-acting help, and when does it just burn tokens? Building a plan-then-execute agent and measuring it against the reactive loop |
+| 5 | **Evaluating agents** | The hardest post. Trajectory vs outcome scoring, why unit tests don't transfer, building a small deterministic benchmark, and what "82% success" is hiding |
+| 6 | **MCP: tools as infrastructure** | Writing a server, the transport, and what standardizing the tool interface actually changes about system design |
+
+Post 2 next: the tools themselves, where the interesting failures move from the loop into the interface between the model and your code.
+
+## References
+
+- Yao et al., [*ReAct: Synergizing Reasoning and Acting in Language Models*](https://arxiv.org/abs/2210.03629), 2022 — the interleaved thought/action/observation pattern this loop implements.
+- Schick et al., [*Toolformer*](https://arxiv.org/abs/2302.04761), 2023 — on models learning when to call tools rather than being told.
+- Liu et al., [*Lost in the Middle*](https://arxiv.org/abs/2307.03172), 2023 — the evidence behind "attention degrades before the context wall does."
+- [Model Context Protocol](https://modelcontextprotocol.io/) — the tool-interface standard: tools as names, descriptions, JSON Schema inputs and structured results, with an emphasis on keeping humans in control of invocation. The subject of post 6. (The spec is actively versioned — check the dated revision, not the homepage, before relying on any detail.)

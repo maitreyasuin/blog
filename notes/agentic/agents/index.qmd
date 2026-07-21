@@ -1,0 +1,17 @@
+---
+title: "🔁 Agents"
+listing-page: true
+listing:
+  contents: .
+  type: default
+  sort: "date desc"
+  sort-ui: false
+  filter-ui: false
+  fields: [image, date, title, depth, description, categories]
+  field-display-names:
+    depth: "Depth"
+page-layout: full
+title-block-banner: true
+---
+
+Tool-using loops that let a model take actions — built from scratch, then broken on purpose to see where they fail.

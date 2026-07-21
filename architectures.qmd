@@ -1,0 +1,16 @@
+---
+title: "🏗️ Architectures"
+page-layout: full
+title-block-banner: true
+---
+
+Attention, transformers, and the model architectures everything else is built from.
+
+::: {.grid .home-cards}
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### [👁️ Attention](notes/architectures/attention/index.qmd)
+Scaled dot-product attention, multi-head splits, cross-attention, and masking — derived from one idea instead of memorized as a formula.
+:::
+
+:::

@@ -1,17 +1,16 @@
 ---
 title: "🤖 Agentic AI"
-listing:
-  contents: notes/agentic
-  type: default
-  categories: true
-  sort: "date desc"
-  sort-ui: false
-  filter-ui: false
-  fields: [image, date, title, depth, description, categories]
-  field-display-names:
-    depth: "Depth"
 page-layout: full
 title-block-banner: true
 ---
 
 Agents and evals - building things that act, and measuring whether they act well.
+
+::: {.grid .home-cards}
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### [🔁 Agents](notes/agentic/agents/index.qmd)
+Tool-using loops that let a model take actions — built from scratch, then broken on purpose to see where they fail.
+:::
+
+:::

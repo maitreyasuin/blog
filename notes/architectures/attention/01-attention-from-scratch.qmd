@@ -1,0 +1,407 @@
+---
+title: "Attention from Scratch: A Soft Dictionary Lookup"
+description: "Why is there a square root in the most-copied equation in deep learning? Derive it rather than accept it, and the rest of attention — multiple heads, cross-attention, masking — falls out of one idea: a lookup where every key matches a little."
+categories: [attention]
+date: 2026-07-20
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+Here is the equation, and here is the part nobody explains:
+
+$$\mathrm{Attention}(Q,K,V) = \mathrm{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V$$
+
+Why $\sqrt{d_k}$? Most treatments say "for numerical stability" and move on, which is true in the way that "because of physics" is true. Let's find out what actually breaks without it — because the answer turns out to explain the whole shape of the operation.
+
+```{python}
+import torch, math
+import torch.nn.functional as F
+
+def unscaled_stats(head_dim, n_keys=50, trials=200):
+    """Median peak weight and entropy of UNSCALED attention over many random draws.
+    One seed is an anecdote; a median over 200 is a claim you can stand behind."""
+    peaks, entropies = [], []
+    for _ in range(trials):
+        q, k = torch.randn(1, head_dim), torch.randn(n_keys, head_dim)
+        p = torch.softmax(q @ k.T, -1)
+        peaks.append(p.max().item())
+        entropies.append(-(p * p.clamp_min(1e-12).log()).sum().item())
+    return torch.tensor(peaks).median().item(), torch.tensor(entropies).median().item()
+
+torch.manual_seed(0)
+print(f"(uniform entropy over 50 keys would be {math.log(50):.2f})")
+for d in [8, 64, 512]:
+    peak, ent = unscaled_stats(d)
+    print(f"d = {d:4d} | median largest weight: {peak:.3f} | median entropy: {ent:.2f}")
+```
+
+At head dimension 8, attention spreads across the keys. By 512, the median largest weight is **0.998** and the entropy has fallen to essentially zero — one key takes nearly all of it. The distribution is collapsing toward hard selection, which means the operation is losing the soft blending *and* the useful gradients that motivated attention in the first place.
+
+(512 is a deliberately wide *head*, chosen to make the effect unmissable. The original transformer used $d_{\text{model}}=512$ split across eight heads, so $d_k=64$ — the middle row here. Read that row as "under this simplified unit-variance random model, the unscaled distribution is already sharply peaked at that width," not as a measurement of what the original model's trained projections actually did.)
+
+The scaling factor is not a numerical nicety bolted onto the formula. It prevents *width alone* from making the operation prematurely sharp — and softness is the entire point:
+
+> **Attention is a soft dictionary lookup.** A hard lookup takes a key and returns one value. Attention takes a *query*, compares it against every key, and returns a **blend** of the values weighted by how well each key matched. Everything else in this post — the scaling, the heads, cross-attention, masking — is bookkeeping in service of that one idea.
+
+Hold onto the word *soft*. It's what makes attention useful to a gradient, and it's what an unscaled dot product erodes as the head gets wider.
+
+> **TL;DR** — Attention scores a query against every key, softmaxes those scores into weights, and returns the weighted average of the values. The $1/\sqrt{d_k}$ exists because $q\cdot k$ has variance $d_k$ when the inputs are unit-scale, so without it the score spread grows with dimension and the softmax saturates into a hard lookup with vanishing gradients. Multiple heads run this in parallel over *subspaces*, so each softmax normalizes independently. And the reshape that splits those heads has a wrong version that returns the right shape — the packed-layout trap from the tensor series, arriving as a real model bug.
+
+## Build it: the lookup, written out
+
+Start with the dictionary analogy taken literally. You have a query, some keys, and their values. A hard lookup finds the matching key. A soft lookup scores *every* key, turns those scores into a probability distribution, and blends:
+
+```{python}
+def attention(q, k, v, mask=None):
+    """Soft dictionary lookup.
+
+    q: (..., Tq, d)  queries — what each position is looking for
+    k: (..., Tk, d)  keys    — what each position offers as a match target
+    v: (..., Tk, dv) values  — what each position actually contributes
+    mask: bool, broadcastable to (..., Tq, Tk). True = this key MAY be attended to.
+
+    Contract: q and k share the feature width; k and v share the source length.
+    Assumes finite floating-point inputs on compatible devices and dtypes — that
+    precondition is not validated here; in production it belongs at the module
+    boundary. Policy: a query with no valid keys gets zero weights and therefore
+    a zero output — see the note below.
+    Returns (..., Tq, dv) and the attention weights.
+    """
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError(f"q and k feature widths differ: {q.shape[-1]} vs {k.shape[-1]}")
+    if k.shape[-2] != v.shape[-2]:
+        raise ValueError(f"k and v source lengths differ: {k.shape[-2]} vs {v.shape[-2]}")
+
+    d = q.shape[-1]
+    scores = q @ k.transpose(-2, -1) / math.sqrt(d)   # (..., Tq, Tk): every query vs every key
+
+    if mask is None:
+        weights = torch.softmax(scores, dim=-1)
+        return weights @ v, weights
+
+    if mask.dtype != torch.bool:
+        raise TypeError("mask must be boolean (True = may attend)")
+    mask = torch.broadcast_to(mask, scores.shape)
+    has_valid = mask.any(dim=-1, keepdim=True)
+
+    scores = scores.masked_fill(~mask, -torch.inf)                     # -inf, not a finite floor
+    scores = torch.where(has_valid, scores, torch.zeros_like(scores))  # keep dead rows finite
+    weights = torch.softmax(scores, dim=-1)
+    weights = torch.where(mask & has_valid, weights, torch.zeros_like(weights))
+    return weights @ v, weights
+```
+
+Three lines of arithmetic. Note the shapes, because they carry the semantics: **the output has one row per *query*, not per key.** A query asks; the keys and values answer; the answer's length is set by how many questions you asked. That's the fact that makes cross-attention work later.
+
+Let's confirm the softness is real:
+
+```{python}
+torch.manual_seed(0)
+q = torch.randn(3, 16)      # 3 queries
+k = torch.randn(6, 16)      # 6 keys
+v = torch.randn(6, 32)      # 6 values, wider than the keys — that's allowed
+
+out, w = attention(q, k, v)
+print(f"queries {tuple(q.shape)}, keys {tuple(k.shape)}, values {tuple(v.shape)} "
+      f"-> output {tuple(out.shape)}")
+torch.testing.assert_close(w.sum(-1), torch.ones(3))
+print("every query's weights sum to 1  ✓")
+torch.testing.assert_close(out, w @ v)
+print("the output really is a weighted average of the values  ✓")
+```
+
+Note that `v` can have a different width than `q` and `k`. The keys live in "matching space"; the values live in "content space". They're forced to the same width in most implementations for convenience, not necessity — and separating them in your head prevents a lot of confusion later.
+
+The masking block deserves a note, because I got it wrong first and the fix is one the [numerical stability post](../../fundamentals/tensors/04-numerical-stability.qmd) already taught. My initial version used `torch.finfo(scores.dtype).min` as the sentinel — reasoning that a finite floor avoids the `0/0` that `-inf` produces on a fully-masked row. But a finite sentinel can **collide with a legitimate score**:
+
+```{python}
+floor = torch.finfo(torch.float32).min
+scores = torch.tensor([[floor, 0.0, 1.0, 2.0]])          # a real score sits at the floor
+mask   = torch.tensor([[True, False, False, False]])     # only position 0 is valid
+print("weight on the sole valid position:",
+      torch.softmax(scores.masked_fill(~mask, floor), -1)[0, 0].item())
+```
+
+A quarter, not one — the valid position ties with every sentinel and shares the mass with keys you explicitly excluded. So the implementation uses `-inf` (which cannot tie with a finite value) plus a `has_valid` guard that keeps fully-masked rows finite, and then zeroes them. The stated policy: **a query with no valid keys returns zero weights and a zero output**, rather than a uniform average over positions you declared invalid.
+
+::: {.callout-warning}
+## Two libraries, two opposite mask conventions
+
+In `F.scaled_dot_product_attention` and in the function above, a boolean mask means **True = may attend**. In `torch.nn.MultiheadAttention`, `attn_mask`/`key_padding_mask` use the **opposite** convention: True means *masked out*. Passing a mask built for one into the other silently inverts your attention. Check which one you're calling.
+:::
+
+## Why $\sqrt{d_k}$, derived
+
+Now the opening puzzle, properly. Assume each $q_i$ and $k_i$ is zero-mean and unit-variance, independent of one another and across coordinates — which is roughly what initialization schemes aim for, so it's a fair starting point, though emphatically an *initialization-scale heuristic* rather than a claim that trained queries and keys stay uncorrelated. Under those assumptions,
+
+$$q\cdot k = \sum_{i=1}^{d_k} q_i k_i, \qquad \mathrm{Var}(q\cdot k) = \sum_{i=1}^{d_k}\mathrm{Var}(q_i k_i) = d_k$$
+
+so the scores have standard deviation $\sqrt{d_k}$. **The spread of the scores grows with the square root of the dimension.** Check it:
+
+```{python}
+for d in [8, 64, 512]:
+    q, k = torch.randn(20_000, d), torch.randn(20_000, d)
+    dots = (q * k).sum(-1)
+    print(f"d = {d:4d} | Var(q·k) = {dots.var():7.1f}   (predicted {d})   std = {dots.std():5.1f}")
+```
+
+Now the consequence. Softmax doesn't care about the absolute size of its inputs — it's shift-invariant — but it cares enormously about their **spread**. Feed it scores that differ by a few units and you get a soft distribution; feed it scores that differ by fifty and one of them wins outright. Since the spread is $\sqrt{d_k}$, the model saturates as it gets wider, which is precisely backwards from what you want.
+
+Dividing by $\sqrt{d_k}$ normalizes the standard deviation back to roughly 1, *independent of dimension*:
+
+```{python}
+for d in [8, 64, 512]:
+    torch.manual_seed(1)
+    q, k = torch.randn(1, d), torch.randn(50, d)
+    for label, scores in [("unscaled", q @ k.T), ("scaled  ", q @ k.T / math.sqrt(d))]:
+        p = torch.softmax(scores, -1)
+        ent = -(p * p.clamp_min(1e-12).log()).sum()
+        print(f"d={d:4d} {label}: max weight {p.max():.4f}, entropy {ent:.3f}")
+```
+
+The scaled rows hold entropy near the uniform value at every dimension. The unscaled ones collapse.
+
+And the reason that matters isn't aesthetic — it's the gradient:
+
+```{python}
+for d in [8, 512]:
+    torch.manual_seed(1)
+    q, k = torch.randn(1, d), torch.randn(50, d)
+    scores = (q @ k.T).detach().requires_grad_()      # gradient wrt the SCORES
+    torch.softmax(scores, -1).max().backward()
+    print(f"d = {d:4d} unscaled: |grad wrt scores| = {scores.grad.norm():.3e}")
+```
+
+A ~350× collapse. Measuring against the *scores* rather than against `q` is deliberate: it isolates the softmax Jacobian from the key norms, the projection dimensionality, and everything else that would otherwise be mixed into a gradient taken with respect to the query. A saturated softmax has a nearly flat Jacobian — when one weight is 0.998, nudging the scores barely moves it — so very little signal survives back through it, and that attenuation multiplies through the Q/K projections upstream. Note what the square root is and isn't doing here: it isn't mainly preventing numerical overflow. It preserves a *useful forward distribution* — the entropy numbers in the opening — and, as a consequence of that, a useful backward signal. The two effects are the same phenomenon seen from either direction.
+
+::: {.callout-note}
+## The scale is a design knob, not a constant
+
+Some architectures deviate deliberately — learning a per-head temperature, or normalizing queries and keys before applying a learned scale. What you now know is what that knob *does*: it sets how peaked attention is allowed to become, and therefore how much gradient survives. That's a more useful thing to carry than the constant.
+:::
+
+## Multiple heads, and why not one wide one
+
+The next design choice looks arbitrary until you ask what a softmax normalizes over. Multi-head attention splits the model dimension into `H` chunks, runs attention independently in each, then concatenates:
+
+```{python}
+class MultiHeadAttention(torch.nn.Module):
+    def __init__(self, d_model, n_heads):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model {d_model} must be divisible by n_heads {n_heads}")
+        self.h, self.dh = n_heads, d_model // n_heads
+        self.q_proj = torch.nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = torch.nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = torch.nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = torch.nn.Linear(d_model, d_model, bias=False)
+
+    def split_heads(self, x):
+        """(B, T, C) -> (B, H, T, dh). Split the FEATURE axis, then move heads forward."""
+        B, T, C = x.shape
+        return x.view(B, T, self.h, self.dh).transpose(1, 2)
+
+    def forward(self, x_q, x_kv=None, mask=None):
+        x_kv = x_q if x_kv is None else x_kv          # self-attention unless told otherwise
+        B, Tq, C = x_q.shape
+        q = self.split_heads(self.q_proj(x_q))
+        k = self.split_heads(self.k_proj(x_kv))
+        v = self.split_heads(self.v_proj(x_kv))
+        out, w = attention(q, k, v, mask)              # broadcasts over (B, H)
+        out = out.transpose(1, 2).reshape(B, Tq, C)    # heads back, then merge
+        return self.o_proj(out), w
+```
+
+```{python}
+torch.manual_seed(0)
+mha = MultiHeadAttention(d_model=64, n_heads=8)
+x = torch.randn(2, 10, 64)
+out, w = mha(x)
+print(f"input {tuple(x.shape)} -> output {tuple(out.shape)}, attention {tuple(w.shape)}")
+assert out.shape == x.shape and w.shape == (2, 8, 10, 10)
+print("shape contract holds  ✓")
+```
+
+**So why not one head of width 64 instead of eight of width 8?** Because the softmax normalizes over the scores it's given, and giving it one set of scores per subspace is a genuinely different computation from giving it one set over the whole space:
+
+```{python}
+torch.manual_seed(0)
+B, T, C, H = 1, 4, 8, 2
+x = torch.randn(B, T, C)
+
+one_head,  _ = attention(x, x, x)                                   # one d=8 lookup
+xs = x.view(B, T, H, C // H).transpose(1, 2)                        # two d=4 subspaces
+two_heads, _ = attention(xs, xs, xs)
+two_heads = two_heads.transpose(1, 2).reshape(B, T, C)
+
+print("one wide head == two narrow heads?", torch.allclose(one_head, two_heads, atol=1e-6))
+```
+
+They differ. One head produces a single distribution over positions, and every feature is blended by those same weights. Two heads produce *two* distributions, so a token can attend to one position for the first half of its features and a different position for the second half. That's the capability multi-head buys: **several different attention patterns at once**, rather than one pattern applied to everything.
+
+Two things that demo simplifies, worth stating so the picture is right. It splits the *raw* input, whereas the real layer splits the output of a learned projection — so each head owns a disjoint slice of the *projected* tensor, but that projection can depend on every original input feature. And it skips the output projection that mixes the heads back together. It's a minimal illustration of independent attention maps, not a full reproduction of learned multi-head attention.
+
+I originally wrote a paragraph here claiming that more heads means smaller `dh`, which means smaller score spread and therefore softer attention. **That's wrong, and it contradicts the derivation two sections above.** The whole purpose of dividing by $\sqrt{d_h}$ is to make the score variance independent of width:
+
+```{python}
+for dh in [8, 32, 64, 512]:
+    q, k = torch.randn(50_000, dh), torch.randn(50_000, dh)
+    raw = (q * k).sum(-1)
+    print(f"dh = {dh:4d} | Var(unscaled) = {raw.var():7.1f} | "
+          f"Var(scaled) = {(raw / math.sqrt(dh)).var():.4f}")
+```
+
+Scaled variance sits at roughly 1 at every width, by construction. So changing head count doesn't buy you softness — the scaling already handled that. What more heads actually buy is **more independently projected subspaces and more separately normalized attention maps**, at the cost of less room in each. Head count affects capacity, optimization, and compute layout; it does not affect initial attention sharpness through the variance argument. I'm leaving the mistake visible because it's the exact failure mode this series keeps finding: a plausible-sounding claim that the post's own earlier maths contradicts.
+
+Sanity check on the other extreme, which should collapse to the simple case:
+
+```{python}
+torch.manual_seed(0)
+solo = MultiHeadAttention(d_model=16, n_heads=1)
+x = torch.randn(2, 6, 16)
+mha_out, _ = solo(x)
+plain, _ = attention(solo.q_proj(x), solo.k_proj(x), solo.v_proj(x))
+torch.testing.assert_close(mha_out, solo.o_proj(plain))
+print("H=1 multi-head reduces exactly to projected single-head attention  ✓")
+```
+
+## Break it: the reshape that scrambles heads
+
+Look again at `split_heads`. It does `view(B, T, H, dh)` and *then* `transpose(1, 2)`. It would be shorter to write `view(B, H, T, dh)` and skip the transpose, and that shorter version is wrong in a way nothing will tell you about:
+
+```{python}
+torch.manual_seed(0)
+B, T, C, H = 2, 5, 12, 3
+dh = C // H
+x = torch.randn(B, T, C)
+
+# What the architecture means: head h owns features [h*dh : (h+1)*dh] of every token.
+spec = torch.stack([x[:, :, h*dh:(h+1)*dh] for h in range(H)], dim=1)
+
+right = x.view(B, T, H, dh).transpose(1, 2)     # split the feature axis, then move heads
+wrong = x.view(B, H, T, dh)                     # "same" shape, one step
+
+print(f"right: {tuple(right.shape)}   matches the spec? {torch.equal(right, spec)}")
+print(f"wrong: {tuple(wrong.shape)}   matches the spec? {torch.equal(wrong, spec)}")
+```
+
+Identical shapes. No exception. No warning. And the second one is silently mixing *token* positions into the head axis, so each "head" is looking at a jumble of different tokens' features rather than a consistent slice of every token's features.
+
+Does it matter downstream? It does:
+
+```{python}
+out_right, _ = attention(right, right, right)
+out_wrong, _ = attention(wrong, wrong, wrong)
+print("do the attention outputs differ?", not torch.allclose(out_right, out_wrong, atol=1e-6))
+```
+
+This is exactly the packed-layout trap from [the strides post](../../fundamentals/tensors/01-strides-views-contiguity.qmd), now wearing a transformer costume. The rule that saves you is the same one: `view` can only split or merge axes *in memory order*. The feature axis is last, so splitting it into `(H, dh)` gives you `(B, T, H, dh)` — and if you want heads in front, you have to *move* them with a transpose, not ask for them in a different order.
+
+The corresponding check is one line, and it's worth writing once when you build the layer:
+
+```{python}
+assert torch.equal(right, spec), "head split does not match the architecture's feature layout"
+print("head split verified against the spec  ✓")
+```
+
+## Cross-attention and masking are the same operation
+
+Two things that get taught as separate mechanisms are, in this implementation, arguments.
+
+**Cross-attention** is what happens when the queries and the keys come from different sequences. The `forward` above already supports it via `x_kv`, and the shape behaviour follows the rule from the top — the output length tracks the *queries*:
+
+```{python}
+torch.manual_seed(0)
+mha = MultiHeadAttention(d_model=32, n_heads=4)
+decoder = torch.randn(1, 5, 32)      # 5 positions asking questions
+encoder = torch.randn(1, 9, 32)      # 9 positions offering answers
+
+out, w = mha(decoder, encoder)
+print(f"queries {decoder.shape[1]}, keys/values {encoder.shape[1]} -> output {out.shape[1]}, "
+      f"weights {tuple(w.shape)}")
+assert out.shape[1] == decoder.shape[1]
+print("output length follows the queries, not the keys  ✓")
+```
+
+That's the whole mechanism behind an encoder-decoder: the decoder issues queries, the encoder supplies keys and values, and the attention matrix is rectangular. Nothing new is required.
+
+**Causal masking** is likewise just a mask argument — a lower-triangular boolean saying "position i may look at position j only if j ≤ i":
+
+```{python}
+T = 6
+causal = torch.tril(torch.ones(T, T, dtype=torch.bool))
+q = torch.randn(1, 1, T, 16)
+_, w = attention(q, q, q, mask=causal)
+
+assert (w.triu(diagonal=1) == 0).all(), "a masked position received attention"
+torch.testing.assert_close(w.sum(-1), torch.ones(1, 1, T))
+print("no position attends to its future, and the rows still sum to 1  ✓")
+```
+
+Note *why* the rows still sum to 1: masking happens on the scores, **before** the softmax, so the surviving entries get renormalized among themselves. Mask after the softmax and your weights no longer sum to one — a bug that produces plausible-looking output with systematically shrunken attention outputs.
+
+A fully masked row — a padded sequence of length zero, say — needs an explicit policy, and the implementation above has one: it detects such rows *before* the softmax, substitutes finite zeros purely so the computation stays defined, then zeroes the weights afterwards. So a query with no valid keys gets a zero output rather than `nan` or a uniform average over positions you declared invalid. That's a decision, not a law; the alternatives are worked through in [numerical stability](../../fundamentals/tensors/04-numerical-stability.qmd). Since it's a policy, it deserves a test:
+
+```{python}
+q, k, v = torch.randn(2, 4), torch.randn(3, 4), torch.randn(3, 5)
+dead = torch.zeros(2, 3, dtype=torch.bool)          # no key is valid for either query
+
+out, w = attention(q, k, v, mask=dead)
+torch.testing.assert_close(w, torch.zeros_like(w))
+torch.testing.assert_close(out, torch.zeros_like(out))
+print("fully masked rows return zero weights and zero output, as documented  ✓")
+```
+
+## Checking against the built-in
+
+The final verification is that our three lines agree with PyTorch's built-in scaled-dot-product-attention API:
+
+```{python}
+torch.manual_seed(0)
+q, k, v = (torch.randn(2, 4, 8, 16) for _ in range(3))
+
+ours, _ = attention(q, k, v)
+torch.testing.assert_close(ours, F.scaled_dot_product_attention(q, k, v))
+
+ours_causal, _ = attention(q, k, v, mask=torch.tril(torch.ones(8, 8, dtype=torch.bool)))
+torch.testing.assert_close(ours_causal, F.scaled_dot_product_attention(q, k, v, is_causal=True))
+print("our implementation agrees with F.scaled_dot_product_attention within tolerance  ✓")
+
+# and the interesting case: does the built-in share our fully-masked policy?
+dead = torch.zeros(8, 8, dtype=torch.bool)
+ours_dead, _ = attention(q, k, v, mask=dead)
+torch.testing.assert_close(ours_dead, F.scaled_dot_product_attention(q, k, v, attn_mask=dead))
+print("...including fully masked rows, where both return zeros  ✓")
+```
+
+That last check surprised me. I expected PyTorch to return `nan` on a fully-masked row and for our zero-output policy to be a deliberate divergence — instead the backend this rendered on makes the same choice. That's reassuring rather than authoritative: it's one backend on one build, and the [numerical stability post](../../fundamentals/tensors/04-numerical-stability.qmd) explains why "attention over nothing" has no single right answer. But it does mean the policy isn't idiosyncratic.
+
+`F.scaled_dot_product_attention` is what you should call in real code. On supported CUDA configurations it can dispatch to FlashAttention or memory-efficient kernels that avoid materializing the full score matrix — the subject of a later post — but backend selection depends on device, dtype, shapes, mask and availability, and it may fall back to a C++ math implementation that computes the reference formulation directly. (On the CPU this post was rendered on, that's exactly what it did.) So: mathematically equivalent for the settings tested here and agreeing within tolerance — but different backends make different floating-point fusion and accumulation choices, and PyTorch says outright that results can differ between them.
+
+## What to carry away
+
+Attention is a soft dictionary lookup: score a query against every key, normalize the scores into weights, return the weighted blend of values.
+
+- **The $\sqrt{d_k}$ removes width-dependent score growth.** Under unit-scale inputs the dot product has variance $d_k$, so without the scaling, *increasing the head width alone* sharpens the softmax and suppresses its gradients — by more than two orders of magnitude between $d{=}8$ and $d{=}512$ here. What it does not do is guarantee soft attention after training: learned query and key norms can grow, correlations develop, and a head may become nearly one-hot because that's genuinely what it learned to do.
+- **The output length follows the queries.** Keys and values answer; queries ask. Once that's internalized, cross-attention needs no separate explanation — it's the same function with `k` and `v` from somewhere else.
+- **Multiple heads are multiple independent softmaxes**, so a token can attend to different positions for different parts of its representation. One wide head cannot do that, and the two are not the same computation.
+- **The head split is a layout operation**, with a shorter wrong version that returns the right shape. `view` splits axes in memory order; getting heads to the front takes a transpose.
+- **Mask before the softmax**, so the surviving weights renormalize — and decide explicitly what a fully-masked row should mean.
+
+If one sentence survives: *attention is an average, the scaling stops head width alone from pushing that average toward a selection, and most of the rest is deciding which sequence supplies the questions and which supplies the answers.*
+
+## Where this goes next
+
+We now have attention that is correct but increasingly memory-hungry as sequences grow: it materializes the full $T \times T$ score matrix, so memory scales quadratically with length. Perfectly fine for short sequences and tests; the problem starts when they aren't short. The next post is positional encodings — because everything above is blind to word order, which is a stranger problem than it sounds. After that, **FlashAttention**, which computes the same mathematical operation without materializing the complete $T \times T$ matrix in high-bandwidth memory — subject to the usual backend-dependent floating-point differences.
+
+## References
+
+- Vaswani et al., [*Attention Is All You Need*](https://arxiv.org/abs/1706.03762), 2017 — the $\sqrt{d_k}$ argument is in a footnote on page 4, and it's the variance argument derived above.
+- [`F.scaled_dot_product_attention`](https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html) — the production API, its available backends, the conditions under which each is dispatched, and the numerical caveats between them.
+- Karpathy, [nanoGPT](https://github.com/karpathy/nanoGPT) — `CausalSelfAttention` is the same layer with a fused QKV projection. (A moving target; check the version you read.)
+- Alammar, [*The Illustrated Transformer*](https://jalammar.github.io/illustrated-transformer/) — the best-known visual treatment, and a good complement if the pictures help more than the algebra.
