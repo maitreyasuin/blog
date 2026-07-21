@@ -29,7 +29,7 @@ format:
       dark: darkly
     css: styles.css
     code-fold: true
-    code-tools: true
+    code-tools: false
     toc: true
     include-in-header:
       - _includes/google-site-verification.html
