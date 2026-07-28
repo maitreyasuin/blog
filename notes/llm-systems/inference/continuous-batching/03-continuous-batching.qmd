@@ -1,0 +1,477 @@
+---
+title: "Continuous Batching: The GPU Was Underfilled, Not Underpowered"
+description: "A decode step costs almost the same for one sequence as for thirty-two, so serving one user wastes most of the machine. Fixing that isn't a kernel problem — it's a scheduling one, and the naive fix makes every request wait for the slowest."
+categories: [llm-systems, inference, serving]
+date: 2026-07-28
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+Here is a fact about decoding that makes serving strange.
+
+A decode step reads every weight in the model out of memory to produce **one token per sequence**. For an 8B model in fp16 that's roughly 16 GB of traffic. The arithmetic on top of it — one token's worth of matrix-vector products — is almost nothing by comparison. So the cost of a decode step is dominated by *streaming the weights*, and the weights get streamed whether you're serving one sequence or thirty-two.
+
+So in this small-batch regime a large fixed cost — reading the weights — gets amortized across however many sequences are live. Adding sequences raises token throughput far faster than it raises iteration latency. Serve one request and you're paying that fixed cost for a single token.
+
+That doesn't hold forever. Each extra sequence adds activation work, KV-cache reads, sampling, and communication under tensor parallelism, so the benefit saturates — at a point set by your hardware, model, context length and latency target, often well before KV memory literally runs out. The simulator below encodes exactly that shape, with a fixed base cost plus a per-sequence increment.
+
+The obvious fix is to batch. The obvious batching is wrong, and it's wrong in a way that's worth seeing before we fix it:
+
+```{python}
+# Two requests arrive. One wants 20 tokens, the other wants 400.
+# Static batching runs them together until BOTH are finished.
+short, long = 20, 400
+print(f"short request finishes its own work after {short} steps")
+print(f"...but its slot is held until step {long}")
+print(f"wasted slot-steps: {long - short} ({(long-short)/long:.0%} of the batch's life)")
+```
+
+The short request finished at step 20 and then occupied a slot for 380 steps producing nothing, because the batch is immutable once launched. Production output lengths are often highly heterogeneous and may be heavy-tailed; when one long request shares an immutable batch with many short ones, a large fraction of the later slot-steps become padding.
+
+> **The bottleneck is real hardware — memory bandwidth — but how much useful work rides along with each pass over the weights depends on how many sequences are live, and that is something the scheduler strongly influences.** (Memory layout, kernels, and model configuration all bound it too; the scheduler is the part this post is about, not the only lever.) The GPU wasn't underpowered; it was underfilled, waiting for a convoy to finish. **Continuous batching** makes the scheduling decision *between every decode step* rather than once per batch: a finished sequence releases its resources immediately, and waiting requests become eligible for admission at the next scheduling boundary — subject to sequence, token, KV-memory, priority and latency budgets. The batch becomes a rolling population instead of a queue of convoys.
+
+> **TL;DR** — Decode is memory-bound at small batch, so per-sequence cost drops sharply as the live batch grows, until another resource or your latency target becomes limiting. Static batching squanders it by holding every slot until the longest request in the group finishes — even for requests that streamed their final token long before. Continuous batching reschedules every iteration. A three-way simulation below separates the two mechanisms — a timeout fixes entrance queueing, only per-iteration rescheduling recovers the slots a convoy wastes — and shows the convoy's cost lands on *throughput*, not on per-token latency. Then the two things that make it real: per-sequence positions and length masking, both of which fail silently, one of them putting most of the attention mass on cache slots that were never written.
+
+## Three generations of batching
+
+**Static batching.** Collect `B` requests, prefill together, decode together until *all* finish. Two failure modes, one per phase. Request #1 waits for request #B to *arrive* before anything starts — that's queueing delay. And a request that finishes at token 20 keeps its slot until the 400-token neighbour is done — that's the convoy.
+
+**Dynamic batching** (classic ML serving) caps the wait with a timeout: fire when full *or* when the oldest waiting request hits its deadline (50 ms in the simulator below). That caps the extra delay spent assembling a batch — it can't remove queueing caused by an already-busy server — and it does nothing about the convoy, because the batch is still immutable once launched. It's the right design for BERT, where one forward pass is one answer. It's the wrong shape for generation, where one forward pass is one *token* of an answer.
+
+**Continuous batching** — iteration-level scheduling, introduced as such in Orca (OSDI 2022) — makes the decision between every decode iteration. Finished sequence: evict now, resources free now. Waiting request: eligible now, and admitted when the scheduler's budgets allow.
+
+One subtlety from that paper worth carrying: Orca batches the length-independent operations (projections, MLP, layernorm) across all tokens while handling variable-length attention separately — **selective batching**. The toy below uses a *different* strategy, and I want to be clear it isn't a simplified Orca: it pads every slot to one fixed capacity and masks the invalid positions. That makes the per-sequence state bugs visible, which is the point, but it still computes over padded capacity. Modern packed and paged kernels avoid computing across the full per-slot capacity and substantially reduce that padding work — TensorRT-LLM's in-flight batching path, for instance, requires packed rather than padded generation inputs.
+
+## Simulate the scheduling effect without a GPU
+
+Before touching CUDA, the scheduling effect can be isolated in a simulator — which runs at render time, so the table below is generated directly from the stated workload and cost model. Its internal comparisons are reproducible; the absolute figures are not hardware measurements.
+
+The cost model encodes the memory-bound behaviour from the opening: prefill scales with prompt length, and each decode iteration costs a fixed base plus a smaller per-sequence increment. **The three constants are illustrative synthetic values**, chosen to produce that shape. They are not benchmark results, and no `tok/s` figure below should be read as a prediction about a real deployment — calibrate against measured prefill and decode curves before using the model that way.
+
+::: {.callout-note}
+## What this simulator does and does not model
+
+**Models:** arrival timing, admission policy, per-iteration scheduling, batch-size-dependent iteration cost, and per-request completion.
+
+**Does not model:** KV memory as a constraint — slots are free and always available, where real concurrency is capped by cache capacity. Nor: preemption, chunked prefill, paged allocation, tensor-parallel communication, tokenizer and sampling overheads, or GPU scheduling detail. It also assumes tokens stream to the client as produced.
+
+That first omission is the significant one. In production the maximum live batch is set by how much KV cache you can hold, which is exactly what paging changes — so the throughput ceiling here is set by my `slots=8` rather than by anything physical.
+:::
+
+```{python}
+import random, statistics
+
+T_PREFILL, T_BASE, T_PER_SEQ = 0.00035, 0.012, 0.0007   # seconds
+
+def make_requests(n, rate, seed=42):
+    """Poisson arrivals with heterogeneous bounded prompt and output lengths.
+
+    Note these are bounded UNIFORM draws, not heavy-tailed — I originally described
+    them as 'heavy-tailed-ish', and the percentiles say otherwise (p99/p50 ~1.9).
+    A heavy-tailed workload would put substantially more probability on rare long
+    outputs, which generally intensifies convoy waste, so this understates it."""
+    rng, t, out = random.Random(seed), 0.0, []
+    for i in range(n):
+        t += rng.expovariate(rate)
+        out.append(dict(arrival=t, prompt=rng.randint(64, 256),
+                        want=rng.randint(16, 256), first=None))
+    return out
+
+# Convention used throughout: prefill produces the FIRST output token. Each later
+# decode iteration consumes the previous token and produces one more. So a request
+# wanting n tokens needs prefill + (n-1) decode steps.
+
+def _run_batch(batch, now):
+    """Prefill a group together, then decode until every member is done."""
+    now += sum(r["prompt"] for r in batch) * T_PREFILL
+    for r in batch:
+        r["first"] = now
+        r["last"] = now
+    for step in range(1, max(r["want"] for r in batch)):
+        now += T_BASE + T_PER_SEQ * len(batch)           # full width every step, padded
+        for r in batch:
+            if step < r["want"]:                          # a finished request stops producing
+                r["last"] = now
+    return now
+
+def run_static(reqs, batch_size=8):
+    """Wait for a full group of batch_size. No timeout."""
+    now, i = 0.0, 0
+    while i < len(reqs):
+        batch = reqs[i:i + batch_size]; i += batch_size
+        now = _run_batch(batch, max(now, batch[-1]["arrival"]))
+    return now
+
+def run_dynamic(reqs, batch_size=8, timeout=0.05):
+    """Launch when the batch fills, or when the oldest waiting request hits its
+    deadline — whichever comes first. Caps the extra batching delay; keeps the convoy."""
+    now, pending = 0.0, list(reqs)
+    while pending:
+        deadline = max(now, pending[0]["arrival"] + timeout)
+        batch, launch = [], deadline          # by default we wait out the deadline
+        while pending and len(batch) < batch_size and pending[0]["arrival"] <= deadline:
+            r = pending.pop(0)
+            batch.append(r)
+            if len(batch) == batch_size:      # full early: launch now, don't wait
+                launch = max(now, r["arrival"])
+                break
+        now = _run_batch(batch, launch)
+    return now
+
+def run_continuous(reqs, slots=8):
+    now, pending, running = 0.0, list(reqs), []
+    while pending or running:
+        while pending and len(running) < slots and pending[0]["arrival"] <= now:
+            r = pending.pop(0)                            # admit and prefill immediately
+            now += r["prompt"] * T_PREFILL                # NOTE: this stalls active decodes
+            r["first"], r["last"], r["done"] = now, now, 1
+            if r["done"] < r["want"]:
+                running.append(r)
+        if not running:
+            now = pending[0]["arrival"]; continue
+        now += T_BASE + T_PER_SEQ * len(running)          # one iteration, whoever's active
+        for r in running:
+            r["done"] += 1; r["last"] = now
+        running = [r for r in running if r["done"] < r["want"]]   # evict immediately
+    return now
+```
+
+```{python}
+def report(name, reqs, makespan):
+    """Throughput here is trace-completion throughput: requested output tokens over
+    the whole makespan, including idle and queueing time. Not kernel throughput."""
+    ttft = sorted(r["first"] - r["arrival"] for r in reqs)
+    # NOTE: one MEAN inter-token time per request, then percentiles across requests.
+    # Not the distribution of individual intervals — a request with steady 15 ms
+    # tokens and one 500 ms hitch would have that hitch averaged away here.
+    mean_tpot = sorted((r["last"] - r["first"]) / max(r["want"] - 1, 1) for r in reqs)
+    n = len(ttft)
+    return (f"{name:<11} {sum(r['want'] for r in reqs)/makespan:>6.0f} tok/s | "
+            f"TTFT p50 {ttft[n//2]:>5.2f}s p95 {ttft[int(.95*n)]:>5.2f}s | "
+            f"mean-TPOT/req p50 {mean_tpot[n//2]*1e3:>5.1f}ms p95 {mean_tpot[int(.95*n)]*1e3:>5.1f}ms")
+
+for rate in [1, 4]:
+    print(f"--- offered load {rate}/s " + "-"*46)
+    for name, fn in [("static", run_static), ("dynamic", run_dynamic),
+                     ("continuous", run_continuous)]:
+        reqs = make_requests(64, rate)
+        print("  " + report(name, reqs, fn(reqs)))
+```
+
+Four readings, and the last one corrects something I published in an earlier draft.
+
+**Dynamic batching caps the extra batching delay; it doesn't fix the convoy.** At light load its TTFT is far better than static, because the timeout bounds how long you wait for a group of eight to assemble — though it can't remove ordinary queueing when the server is already saturated. Its throughput is unchanged. Capping entrance delay and reclaiming convoy waste are separate problems.
+
+**At higher load the timeout stops helping**, because the batch fills before it expires. Dynamic and static converge, and continuous batching separates on throughput.
+
+**The convoy shows up in throughput, not in per-token latency.** This is the correction. An earlier version of this post reported that static batching's TPOT p95 was ~115 ms against continuous batching's ~17 ms, and claimed *that gap is the convoy*. It wasn't — it was a bug in my own metric. I was updating each request's last-token timestamp on **every** iteration of its batch, including the steps after it had already finished generating, so a request wanting 20 tokens inside a 400-step batch was charged for 380 idle steps. Once a finished request stops ticking, TPOT across the strategies is nearly identical. The convoy's real cost is that a completed request keeps occupying a slot, which reduces effective concurrency — a **throughput** loss, which is exactly where the table shows it.
+
+**Static and dynamic match on mean TPOT only once both are launching full batches.** At high load they agree to the decimal — 17.6 ms, p50 and p95 — because both run groups of eight, and this cost model makes iteration time a function of batch size alone. A request wanting *w* tokens then takes exactly (*w*−1) iterations, so its mean inter-token time *is* the iteration time, identically, for every request. At light load they diverge: dynamic frequently fires on its timeout with a smaller group, which shortens the iteration and drops its mean TPOT to 13.4 ms at the median and 15.5 ms at p95.
+
+(I previously wrote that the two agreed "identically, for every request at every load." That was false, and I'd introduced the sentence myself after noticing the matching figures — in the high-load row only. A paragraph asserting something the table two inches above it contradicts is the recurring defect of this whole series, and reading one row rather than both is how it happens.)
+
+**Continuous batching can be slightly worse on mean TPOT, and that's not a flaw.** Look at the high-load row: it runs fuller batches, and in this cost model a fuller batch means a marginally longer iteration. Higher throughput and slightly slower per-token streaming is a real trade, not a free lunch — and it's why production schedulers make admission a *policy* rather than a reflex.
+
+One caveat the simulator hides, and the metric above cannot expose: `run_continuous` prefills a newly admitted request **inline**, stalling every active decode while it runs. A long prompt hitches everyone else's token stream — but because the table reports a *mean* inter-token time per request, a single long stall gets averaged away. Catching it would mean recording individual token timestamps and reporting token-level ITL p99 and maximum inter-token gap. That interference is exactly what chunked prefill exists to fix, and this workload understates it anyway because it has no very long prompts.
+
+## The memory problem underneath
+
+Iteration-level scheduling creates a memory-management problem it doesn't solve. Requests of unknown final length are constantly entering and leaving, each holding a KV cache that grows every step — and from the [KV cache post](../kv-cache/index.qmd), that's roughly 0.1–0.5 MB *per token* for 7–8B models.
+
+The simplest thing that works is to preallocate a fixed-size slot per concurrent sequence. It works, and it wastes whatever capacity the sequences don't use:
+
+```{python}
+for capacity, lengths in [(2048, [128, 512, 90, 1400]),
+                          (2048, [2000, 1990, 2010, 1950])]:
+    waste = 1 - sum(lengths) / (len(lengths) * capacity)
+    print(f"capacity {capacity}, actual lengths {lengths}: {waste:.0%} of the pool is padding")
+```
+
+Same capacity, same number of slots, and the waste swings from three-quarters to almost nothing.
+
+I want to be precise about the cause, because I originally attributed this to length *variance* and that's wrong. The waste is exactly `1 − mean(length)/capacity`: it depends on mean utilization, and two workloads with identical means but wildly different spreads waste identically. What heterogeneous lengths actually do is make a single capacity **hard to choose efficiently** — size it for the tail and you waste it on the common case, size it for the median and long requests fail. Bucketing, multiple pools, request classes, and a known workload distribution all help; a single fixed number doesn't.
+
+(A correction to something I wrote in an earlier draft: I framed this as "the scheduler buys latency, paging buys throughput." That decomposition is wrong. Iteration-level scheduling improves throughput directly by replacing finished work immediately — Orca reported large throughput gains before PagedAttention existed. Paging is orthogonal: it raises achievable concurrency by reclaiming the waste above, which *amplifies* the scheduler's gains. How much each contributes depends entirely on the baseline and workload.) **PagedAttention** (vLLM, SOSP 2023) is the answer: chop KV memory into fixed-size blocks (16 tokens, say), give each sequence a block table mapping logical position to physical block, and allocate on demand. Waste collapses to the last partially-filled block per sequence. The paper reports fragmentation losses of 60–80% under the contiguous scheme, and under 4% with paging.
+
+The bonus is sharing. Identical prefixes — a system prompt every request carries — can map to the *same* physical blocks, which is the mechanism behind prefix caching. On a cache hit, the already-computed resident prefix blocks are reused and their prefill is skipped; the unmatched suffix, the partial trailing block, and anything since evicted still have to be computed. That's a genuinely different capability, not just a smaller number.
+
+## Build it: a slot-based engine
+
+Full paging needs a custom attention kernel. The honest version that fits in a post is **slot-based preallocation** — one max-length cache slot per concurrent sequence, with per-sequence lengths and mask-based attention. Think of it as the degenerate limit of paging, where each request gets one page big enough for its entire maximum sequence — the analogy explains the waste, though it lacks the block table and on-demand mapping that actually define paged KV memory. The padding you just computed is precisely why real systems don't stop here.
+
+Two pieces of state carry the whole design:
+
+```{python}
+import torch
+torch.manual_seed(0)
+
+n_slots, max_len, n_heads, head_dim = 4, 32, 2, 8
+
+# Preallocated storage. Its contents say nothing about which positions are valid;
+# only `lengths` does.
+k_pool = torch.zeros(n_slots, n_heads, max_len, head_dim)
+v_pool = torch.zeros_like(k_pool)
+lengths = torch.tensor([0, 0, 0, 0])                        # how much of each slot is real
+
+print(f"pool: {tuple(k_pool.shape)} = (slots, heads, capacity, head_dim)")
+print(f"lengths: {lengths.tolist()}  <- the only thing that says what's valid")
+```
+
+The `lengths` vector is doing more work than it looks. Every sequence in the batch is at a *different* point in its generation, so it needs its own position for the embedding and its own mask for attention. Both of those are where things break.
+
+## Break it (twice), because both failures are silent
+
+### The position bug, third appearance
+
+Readers of the [KV cache post](../kv-cache/index.qmd) have met this bug twice — once with learned absolute embeddings, once in rotary clothing in the positional encodings post. Here it is at batch scale, which is its most natural habitat, because now the *correct* position is different for every row.
+
+```{python}
+lengths = torch.tensor([5, 12, 3])          # three sequences, three different histories
+wpe = torch.nn.Embedding(64, 8)
+
+right = wpe(lengths)                                        # each sequence at its own position
+wrong = wpe(torch.full((3,), int(lengths.max())))           # one position for the whole batch
+
+print(f"shapes identical:      {right.shape == wrong.shape}")
+print(f"embeddings differ:     {not torch.allclose(right, wrong)}")
+print(f"max absolute difference: {(right - wrong).abs().max():.3f}")
+```
+
+Same shape, no exception. Writing `pos = torch.full((B,), t)` for a batched decode loop feels natural — there *is* a single step counter, after all — and it silently tells two of those three sequences they're somewhere they aren't. The fix is that `lengths` vector: `pos = lengths`, one position per row, updated per row.
+
+### Attending to memory you never wrote
+
+The second one is specific to preallocated pools, and it's worse because the corruption is quantitative rather than categorical.
+
+```{python}
+n_slots, capacity, n_heads, head_dim = 3, 16, 2, 4
+k_pool = torch.randn(n_slots, n_heads, capacity, head_dim)   # debug-filled garbage
+q = torch.randn(n_slots, n_heads, 1, head_dim)
+lengths = torch.tensor([5, 12, 3])
+
+scores = (q @ k_pool.transpose(-2, -1)) / head_dim ** 0.5
+dead = torch.arange(capacity)[None, :] > lengths[:, None] - 1     # (slots, capacity)
+
+def invalid_mass(weights):
+    """How much attention mass lands on positions that were never written."""
+    return (weights.masked_select(dead[:, None, None, :].expand_as(weights)).sum()
+            / (n_slots * n_heads)).item()
+
+# Controlled comparison: same valid keys in both, only the UNWRITTEN region differs.
+zeroed_pool  = k_pool.masked_fill(dead[:, None, :, None], 0.0)
+zeroed_scores = (q @ zeroed_pool.transpose(-2, -1)) / head_dim ** 0.5
+
+masked        = scores.masked_fill(dead[:, None, None, :], -torch.inf).softmax(-1)
+unmasked      = scores.softmax(-1)
+zeroed_region = zeroed_scores.softmax(-1)
+
+print(f"unmasked, random values in the unwritten region: {invalid_mass(unmasked):.3f}")
+print(f"unmasked, zeros in the unwritten region        : {invalid_mass(zeroed_region):.3f}")
+print(f"masked                                         : {invalid_mass(masked):.1e}")
+
+torch.testing.assert_close(masked.sum(-1), torch.ones(n_slots, n_heads, 1))
+print("masked rows still sum to 1  ✓")
+```
+
+**More than half the attention mass** lands on cache positions that were never written. Not a subtle degradation — the model is attending mostly to garbage — and yet every shape is right, the softmax rows sum to one, and nothing raises.
+
+Three precisions on that, each of which cost me a draft.
+
+It's a *debug fill*, not literally uninitialized memory: `torch.randn` writes every element, while a genuinely uninitialized allocation holds whatever happened to be there.
+
+An earlier version quoted a leak figure from a *different run* than the one the cell printed — a number in prose that its own code doesn't produce, which is the defect this series keeps finding. Both figures now come from the same cell.
+
+And the random-versus-zero comparison itself was confounded until this revision. I had zeroed *all* the scores, valid positions included, which changes two things at once. The cell above now zeroes only the unwritten region and leaves the valid keys identical, so it answers the actual question: given the same real cache contents, does it matter what's sitting in the part you never wrote? It leaks comparably either way, because near-equal scores give a near-uniform softmax. My earlier claim that zeros "quietly dilute the output while random values corrupt it visibly" is an inference about the *output*, and this experiment builds no V-cache to test it — treat it as a hypothesis, not a result.
+
+The masking line is the same broadcast comparison from the [tensor series](../../../fundamentals/tensors/02-broadcasting-reductions-einsum.qmd): a row of positions against a column of lengths. In this form it also inherits the fully-masked-row hazard from the [numerical stability post](../../../fundamentals/tensors/04-numerical-stability.qmd) — a slot with length 0 masks every position, and softmax over all `-inf` is `0/0`. So the toy needs an explicit policy, not just a mask: **inactive rows are either excluded from the batch entirely, or assigned zero attention weights and a zero output by construction.** A validity mask alone cannot rescue an all-invalid row, which is exactly the empty-row policy the attention chapter argues you have to choose deliberately.
+
+## The scheduler, in about forty lines
+
+With per-sequence lengths and masking handled, the scheduler itself is small. It's the same admit/step/evict loop the simulator used, now against real slot state:
+
+```{python}
+from dataclasses import dataclass
+
+@dataclass
+class Completion:
+    """Which request ended, and why. Only 'finished' is reachable in this toy —
+    validation rejects anything that couldn't complete — but a real scheduler that
+    admits speculatively or preempts under memory pressure needs the other reasons."""
+    request_id: int
+    reason: str            # "finished" | (real systems: "preempted", "cancelled", ...)
+    generated: int
+
+class SlotScheduler:
+    """Continuous batching over a fixed pool of KV slots.
+    Pedagogical: tracks occupancy and lengths, not the tensors themselves."""
+
+    def __init__(self, n_slots, capacity):
+        if n_slots < 1:
+            raise ValueError(f"n_slots must be positive; got {n_slots}")
+        if capacity < 1:
+            raise ValueError(f"capacity must be positive; got {capacity}")
+        self.capacity = capacity
+        self.free = list(range(n_slots))
+        self.active = {}                        # slot -> request
+        self.lengths = torch.zeros(n_slots, dtype=torch.long)
+
+    def validate(self, request):
+        """Reject what can't be served, rather than truncating it and calling it done."""
+        p, w = request["prompt_len"], request["want"]
+        if not isinstance(p, int) or not isinstance(w, int):
+            raise TypeError("prompt_len and want must be integers")
+        if p < 1:
+            raise ValueError("prompt_len must be positive; this toy has no implicit BOS")
+        if w < 1:
+            raise ValueError("want must be positive")
+        # Under our convention prefill produces token 1, so w tokens need w-1 decode
+        # steps and the sequence peaks at p + (w-1) KV positions -- not p + w.
+        needed = p + w - 1
+        if needed > self.capacity:
+            raise ValueError(f"request needs {needed} KV positions; capacity is {self.capacity}")
+
+    def admit(self, request):
+        """Prefill into a free slot. Prefill produces the first token (see convention above).
+        Returns (slot, outcome): outcome is 'running', or 'finished' if one token was enough."""
+        self.validate(request)
+        if not self.free:
+            return None, None
+        slot = self.free.pop()
+        self.lengths[slot] = request["prompt_len"]
+        request["generated"] = 1                          # prefill emitted token 1
+        if request["generated"] >= request["want"]:       # want == 1: done at prefill
+            self.lengths[slot] = 0
+            self.free.append(slot)
+            return slot, "finished"
+        self.active[slot] = request
+        return slot, "running"
+
+    def step(self):
+        """One decode iteration for every active slot.
+        Returns [Completion] for whatever ended this iteration."""
+        if not self.active:
+            return []
+        slots = sorted(self.active)
+        self.lengths[slots] += 1                # every live sequence grew by one token
+
+        done = []
+        for slot in slots:
+            r = self.active[slot]
+            r["generated"] += 1
+            if r["generated"] >= r["want"]:
+                done.append((slot, Completion(r["id"], "finished", r["generated"])))
+            # No capacity branch here: validate() guarantees p + w - 1 <= capacity, so an
+            # admitted request always finishes before it can exhaust its slot. A scheduler
+            # that admits speculatively, or lets requests extend after admission, needs one.
+            assert self.lengths[slot] <= self.capacity, "slot overran its capacity"
+        for slot, _ in done:                    # evict NOW, not at end of batch
+            del self.active[slot]
+            self.lengths[slot] = 0
+            self.free.append(slot)
+        return [c for _, c in done]
+
+    def run(self, requests):
+        """Reconsider admission every iteration; here the policy is 'fill any free slot'."""
+        pending, completions = list(requests), []
+        while pending or self.active:
+            while pending and self.free:
+                request = pending.pop(0)
+                slot, outcome = self.admit(request)
+                if outcome == "finished":
+                    completions.append(Completion(request["id"], "finished",
+                                                  request["generated"]))
+            completions.extend(self.step())
+        return completions
+```
+
+```{python}
+sched = SlotScheduler(n_slots=4, capacity=512)
+requests = [dict(id=i, prompt_len=64 + 8 * i, want=16 + 40 * (i % 5)) for i in range(20)]
+
+completions = sched.run(requests)
+assert len(completions) == len(requests)
+assert all(c.reason == "finished" for c in completions)
+assert sorted(c.request_id for c in completions) == list(range(20))   # identity preserved
+assert not sched.active and len(sched.free) == 4 and (sched.lengths == 0).all()
+print(f"{len(completions)}/{len(requests)} finished, all identified, all slots released  ✓")
+
+# edge cases the happy path never reaches
+bad_requests = [(dict(id=0, prompt_len=0,   want=5),   "empty prompt"),
+                (dict(id=0, prompt_len=10,  want=0),   "zero output"),
+                (dict(id=0, prompt_len=1.5, want=5),   "non-integer"),
+                (dict(id=0, prompt_len=500, want=100), "over capacity")]
+for bad, why in bad_requests:
+    try:
+        SlotScheduler(2, 512).admit(bad); print(f"{why:15s}: accepted — bad")
+    except (ValueError, TypeError) as e:
+        print(f"{why:15s}: {type(e).__name__}  ✓")
+
+for kwargs, why in [(dict(n_slots=0, capacity=512), "n_slots=0 (would hang run())"),
+                    (dict(n_slots=4, capacity=0),   "capacity=0")]:
+    try:
+        SlotScheduler(**kwargs); print(f"{why}: accepted — bad")
+    except ValueError:
+        print(f"{why}: rejected  ✓")
+
+# the boundary the old p+w check got wrong: needs exactly `capacity` positions
+edge = SlotScheduler(2, 512)
+_, outcome = edge.admit(dict(id=0, prompt_len=512, want=1))
+assert outcome == "finished" and len(edge.free) == 2
+print("prompt=512, want=1 at capacity 512: admitted and completed at prefill  ✓")
+```
+
+Two different kinds of invariant are tangled together here, and separating them sharpens the point.
+
+**The scheduling invariant** is what makes this continuous rather than static: **the schedule is reconsidered every iteration.** Finished requests release their resources immediately, and waiting requests *may* be admitted — subject to sequence, token, KV-memory, priority and latency budgets. Admitting on every free slot, as the toy does, is one policy inside that invariant, not the invariant itself. TensorRT-LLM makes the separation explicit with two schedulers: a capacity scheduler deciding which requests can hold KV and other resources, and a microbatch scheduler choosing which of those actually run in a given step. Remove the per-iteration reconsideration and you have static batching with extra bookkeeping.
+
+**The model-state invariants** are what make it *correct*: every sequence carries its own position, and every attention operation sees only that sequence's valid KV. Drop those and you don't get static batching — you get a fast scheduler computing wrong answers, which is worse.
+
+The assertions check a real invariant, not decoration: a scheduler that leaks slots looks completely healthy until throughput mysteriously decays to zero over an hour of serving. Asserting the pool returns to full is the cheapest guard against that class of bug.
+
+One thing this toy gets structurally wrong, worth naming so you don't carry it forward: **it admits on slot availability alone.** Production schedulers budget *tokens*, not sequences — vLLM exposes both a maximum sequence count and a maximum scheduled-token count per iteration, and chunked prefill spends whatever token budget the decodes leave over. "Is there a free row?" is the wrong question; "which mix of decode tokens and prefill chunks fits this iteration's compute and memory budget without blowing the latency target?" is the right one. And admitting *immediately* isn't always right either — a new prefill lengthens the current iteration and degrades TPOT for everyone already streaming, which is why decode-prioritized policies exist. Continuous batching means the scheduler *may reconsider* the batch each iteration, not that every waiting request enters the moment a slot opens.
+
+## What real engines add
+
+Five things, each of which exists because the version above breaks somewhere.
+
+**Chunked prefill** (Sarathi-Serve). A long prompt's prefill monopolizes an iteration, and every decode sharing that step stalls — users see a hitch in their token stream caused by someone else's request arriving. Split prefills into chunks and co-schedule them with decodes.
+
+**Prefix caching.** Hash prompt blocks so a repeated system prompt can skip prefill for the *full* blocks that are still resident — partial trailing blocks, unmatched suffixes, evicted blocks, and any cache isolated by a per-request salt still have to be computed. With paged blocks the reuse is a refcount rather than a copy, which is why the memory representation and the feature are the same design decision.
+
+**Preemption.** When the block pool runs dry, evict a running sequence — recompute it later, or swap its blocks to CPU — rather than refusing admission. Which policy you pick shows up directly in your p99.
+
+**Prefill/decode disaggregation** (DistServe, Splitwise). Run the two phases on *separate GPU pools*, sized independently, shipping the KV cache between them — one answer to the compute-bound/memory-bound split from the [KV cache post](../kv-cache/index.qmd). It isolates the interference and lets you provision each phase properly, at the cost of transferring KV state, routing, and balancing two pools. Recent work finds aggregated, disaggregated and hybrid arrangements each win under different TTFT/TPOT targets, so it's a design point rather than the endpoint.
+
+**Speculative decoding**, which composes with all of it and changes the scheduler's assumptions, because now a "step" can produce a variable number of tokens per sequence.
+
+The landscape, as of writing and ageing fast: vLLM (paged KV, prefix caching, a token-budget scheduler), SGLang (continuous batching plus RadixAttention prefix reuse), TensorRT-LLM (in-flight batching over packed inputs, NVIDIA-specific kernels), and HF TGI (continuous batching, now in maintenance mode with vLLM and SGLang recommended for new work). All iteration-level scheduling at the core; check current docs before relying on any specific capability.
+
+## What to carry away
+
+Decode leaves expensive hardware underused, and the scheduler decides whether that bandwidth goes to live sequences or to empty and padded slots.
+
+- **Decode is memory-bound at small batch**, so adding sequences raises token throughput much faster than it raises iteration latency — until compute, KV traffic, communication or your latency target becomes limiting. Keeping *useful* work in flight is central; keeping every slot merely occupied is not the same thing.
+- **Static batching wastes slots on the convoy**: a request that finishes early holds its slot until the longest one in its group is done, and real length distributions are heavy-tailed.
+- **It improves latency and throughput by different mechanisms**, and a three-way comparison separates them. A timeout caps the extra delay spent assembling an entrance batch, which is a TTFT effect. Only per-iteration rescheduling recovers the slots a convoy wastes, which is a *throughput* effect — not a per-token-latency one, as I incorrectly claimed before fixing my own metric. Paged memory is orthogonal and amplifies both by raising achievable concurrency.
+- **Per-sequence state is where it breaks, silently.** One shared position for a batch at different lengths: right shape, wrong embeddings. No length mask on a preallocated pool: more than half the attention mass on cache slots that were never written, rows still summing to one.
+- **Fixed-capacity slots waste whatever reserved capacity goes unused** — 74% in the first example above. That's exactly `1 − mean(length)/capacity`, not a function of variance; what length heterogeneity does is make one fixed capacity difficult to choose efficiently, which is the motivation for paging the cache instead.
+
+If one sentence survives: *continuous batching turns generation from fixed request batches into per-iteration resource allocation — and the interesting question isn't how fast the kernel runs, but which decode tokens and prefill chunks should run now, given the memory you have and the latency you promised.*
+
+## Where this goes next
+
+That completes the inference arc: [the KV cache](../kv-cache/index.qmd) made one sequence fast and revealed the memory bill, [FlashAttention](../flash-attention/02-flash-attention.qmd) made long-sequence attention memory-efficient, and continuous batching turned one GPU into a multi-tenant service. The natural next stops are the techniques that attack the cache itself — MLA, quantized caches — and speculative decoding, which uses additional parallel draft-and-verification work to cut the number of serial decoding iterations.
+
+## References
+
+- Yu et al., [*Orca: A Distributed Serving System for Transformer-Based Generative Models*](https://www.usenix.org/conference/osdi22/presentation/yu), OSDI 2022 — iteration-level scheduling and selective batching.
+- Kwon et al., [*Efficient Memory Management for LLM Serving with PagedAttention*](https://arxiv.org/abs/2309.06180), SOSP 2023 — the fragmentation measurements and the block-table design.
+- Agrawal et al., [*Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve*](https://arxiv.org/abs/2403.02310), 2024 — chunked prefill.
+- Zhong et al., [*DistServe: Disaggregating Prefill and Decoding*](https://arxiv.org/abs/2401.09670), 2024.
+- Pope et al., [*Efficiently Scaling Transformer Inference*](https://arxiv.org/abs/2211.05102), 2022 — the roofline treatment behind the opening.
+- [vLLM documentation](https://docs.vllm.ai/) — paged KV, prefix caching, chunked prefill, and the scheduler this post is a toy version of.
