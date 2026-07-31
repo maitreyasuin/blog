@@ -1,19 +1,16 @@
 ---
 title: "🎨 Generative"
-listing:
-  contents:
-    - notes/generative/**/*.qmd
-    - "!notes/generative/**/index.qmd"
-  type: default
-  categories: true
-  sort: "date desc"
-  sort-ui: false
-  filter-ui: false
-  fields: [image, date, title, depth, description, categories]
-  field-display-names:
-    depth: "Depth"
 page-layout: full
 title-block-banner: true
 ---
 
 Diffusion, GANs/VAEs, vision-language models, and world models - generating pixels, video, and more.
+
+::: {.grid .home-cards}
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### [🌀 Diffusion](notes/generative/diffusion/index.qmd)
+Denoising as the whole trick - the forward process, classifier-free guidance, and the noise schedule that decides where a fixed timestep budget goes.
+:::
+
+:::
