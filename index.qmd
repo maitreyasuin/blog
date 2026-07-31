@@ -48,4 +48,9 @@ Attention, transformers, and the model architectures everything else is built fr
 Inference, serving, post-training, evaluation, and scaling — how modern LLMs are built, optimized, and deployed.
 :::
 
+::: {.g-col-12 .g-col-md-6 .home-card}
+### 🎨 [Generative](generative.qmd)
+Diffusion, GANs, and the models built to generate rather than just predict.
+:::
+
 :::
