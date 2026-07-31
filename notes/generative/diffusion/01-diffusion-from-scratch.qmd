@@ -1,0 +1,289 @@
+---
+title: "Diffusion from Scratch: One Model, Two Samplers"
+description: "A diffusion model is trained to predict the noise that was added to an image, not the image. That parameterisation gives a fixed-scale training target — and once the network is trained, DDPM and DDIM use that same denoiser to trace different reverse trajectories through the same noise levels."
+categories: [generative, diffusion]
+date: 2026-07-29
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+Here is the thing that surprises people about diffusion models: **in the ε-parameterised setup below, the network is not trained to output a clean image at all.** It looks at a corrupted image and predicts the noise that corrupted it. The sampler is what turns that estimate into an image.
+
+That sounds like a detail. It's the design decision the whole method rests on, and it's also why the training loop is three lines long while the sampler is the complicated part.
+
+The structure worth carrying through this post:
+
+> **The forward process is fixed, closed-form, and has no parameters. The network is trained on a single prediction target. The sampler is a separate choice you make afterwards** — and DDPM and DDIM are two such choices, over the same weights, differing only in how they step backwards. (Other formulations predict x₀, or **v**, or the score, and some also learn the reverse variance; this post takes the ε route throughout.)
+
+Most confusion about diffusion comes from those three being taught as one thing.
+
+> **TL;DR** — Noising is a fixed Gaussian process with a closed form: you can jump to any timestep in one line, which is what makes training cheap. The network predicts the noise ε, and the ε ↔ x₀ conversion is an exact identity, not an approximation. Sampling then walks back down. DDPM's step is stochastic; DDIM's is the deterministic limit of the same family, controlled by one parameter η — and it lets you skip most of the timesteps. Below: the forward process verified against its own iterative definition, both samplers implemented, and the terminal-step variance mistake that quietly adds noise to a finished sample.
+
+## The forward process is not learned
+
+Take an image, add a little Gaussian noise, repeat a thousand times, and you end up with approximately pure noise. That's the forward process, and it has no parameters — just a schedule of variances $\beta_1 \dots \beta_T$ saying how much noise to add at each step.
+
+Written one step at a time:
+
+$$x_t = \sqrt{1-\beta_t}\,x_{t-1} + \sqrt{\beta_t}\,\epsilon, \qquad \epsilon \sim \mathcal{N}(0, I)$$
+
+Applying that a thousand times to build a training example would be absurd. The reason it isn't necessary is that composing Gaussians gives another Gaussian, and the whole chain collapses:
+
+$$q(x_t \mid x_0) = \mathcal{N}\!\left(\sqrt{\bar\alpha_t}\,x_0,\ (1-\bar\alpha_t) I\right), \qquad \bar\alpha_t = \prod_{s\le t}(1-\beta_s)$$
+
+**One line takes you to any timestep.** That's what makes training tractable: each example samples a random `t`, jumps straight there, and never touches the intermediate states.
+
+```{python}
+import torch, math
+torch.manual_seed(0)
+
+T = 1000
+betas = torch.linspace(1e-4, 0.02, T)          # the linear schedule from the DDPM paper
+alphas = 1.0 - betas
+abar = torch.cumprod(alphas, dim=0)            # ᾱ_t
+
+def extract(schedule, t, x):
+    """Index a 1-D schedule by a batch of timesteps, on x's device, shaped to broadcast.
+    The device move matters: indexing a CPU schedule with a CUDA `t` raises."""
+    out = schedule.to(x.device)[t]
+    return out.view(-1, *([1] * (x.ndim - 1)))
+
+def q_sample(x0, t, noise=None):
+    """Jump straight to timestep t. No loop."""
+    noise = torch.randn_like(x0) if noise is None else noise
+    ab = extract(abar, t, x0)                  # index once; in a real model, register
+    return ab.sqrt() * x0 + (1 - ab).sqrt() * noise   # the schedules as buffers instead
+
+print(f"ᾱ at t=0:   {abar[0]:.4f}   (almost all signal)")
+print(f"ᾱ at t=500: {abar[500]:.4f}")
+print(f"ᾱ at t=999: {abar[-1]:.2e}  (essentially pure noise)")
+```
+
+The closed form is a claim about a stochastic process, so it's worth checking rather than trusting — run the definition the slow way and compare the statistics:
+
+```{python}
+x0 = torch.randn(2000, 32) * 0.6          # stand-in for a batch of flattened images
+t  = 400
+
+x_iter = x0.clone()                        # the definition, one step at a time
+for s in range(t + 1):
+    x_iter = alphas[s].sqrt() * x_iter + betas[s].sqrt() * torch.randn_like(x_iter)
+
+pred_mean_scale = abar[t].sqrt()
+pred_var        = abar[t] * x0.var() + (1 - abar[t])
+
+print(f"iterative:  var {x_iter.var():.4f}")
+print(f"closed form predicts: var {pred_var:.4f}")
+assert abs(x_iter.var() - pred_var) < 0.02
+print(f"\nand the mean scales by ᾱ^½ = {pred_mean_scale:.4f}  ✓")
+```
+
+## What the network learns, and why it's the noise
+
+Given a noisy $x_t$, the network could be asked to predict several things: the clean image $x_0$, the noise $\epsilon$, or the mean of the reverse step. They're algebraically interchangeable — rearranging the forward equation gives
+
+$$x_0 = \frac{x_t - \sqrt{1-\bar\alpha_t}\;\epsilon}{\sqrt{\bar\alpha_t}}$$
+
+so predicting either one determines the other exactly. This is an identity, not an approximation:
+
+```{python}
+x0 = torch.randn(3, 16)
+eps = torch.randn(3, 16)
+t = 700
+xt = abar[t].sqrt() * x0 + (1 - abar[t]).sqrt() * eps
+
+x0_recovered = (xt - (1 - abar[t]).sqrt() * eps) / abar[t].sqrt()
+torch.testing.assert_close(x0_recovered, x0, atol=1e-4, rtol=1e-4)
+print("x₀ recovered exactly from x_t and ε  ✓")
+```
+
+If they're algebraically interchangeable, why predict ε? Not because the other targets are unusable — it's that **an unweighted MSE means something different in each parameterisation**. The conversion between an ε-error and an x₀-error carries a factor of $\sqrt{(1-\bar\alpha_t)/\bar\alpha_t}$, which varies by orders of magnitude across the schedule. So an unweighted MSE on ε implicitly applies one weighting across noise levels, and an unweighted MSE on x₀ applies a very different one. The ε target also has a fixed unit scale at every `t`, which makes the objective easy to optimise without further tuning.
+
+DDPM's simplified ε-objective works well empirically and is what this post uses. It is a design choice rather than the only well-conditioned one — later work separates parameterisation, preconditioning, and loss weighting explicitly, precisely because the implicit weighting is the thing that matters.
+
+Which makes the training loop this:
+
+```{python}
+def diffusion_loss(model, x0):
+    """The entire training objective."""
+    t = torch.randint(0, T, (x0.shape[0],), device=x0.device)
+    noise = torch.randn_like(x0)
+    xt = q_sample(x0, t, noise)              # extract() handles device and broadcast
+    return torch.nn.functional.mse_loss(model(xt, t), noise)
+```
+
+Four lines. No adversarial alternation, no likelihood bound to evaluate, no sequential noising or learned inner loop during training. Nearly all the difficulty in diffusion lives elsewhere — in the sampler, the schedule, and the conditioning.
+
+## Sampling: walking back up
+
+Training was easy because the forward process is closed-form. Sampling is harder because the *reverse* process isn't: to go from $x_t$ to $x_{t-1}$ you need $q(x_{t-1} \mid x_t)$, which depends on the data distribution and isn't available. What the network gives you is an estimate of ε, and from that an estimate of $x_0$ — and the reverse step is built out of those.
+
+**DDPM** takes the ancestral step: estimate the posterior mean, then add fresh noise scaled by the step's variance.
+
+```{python}
+alphas_cumprod_prev = torch.cat([torch.tensor([1.0]), abar[:-1]])
+posterior_var = betas * (1 - alphas_cumprod_prev) / (1 - abar)
+
+@torch.no_grad()
+def ddpm_step(model, xt, t):
+    eps = model(xt, torch.full((xt.shape[0],), t, device=xt.device))
+    mean = (xt - betas[t] / (1 - abar[t]).sqrt() * eps) / alphas[t].sqrt()
+    if t == 0:
+        return mean                                    # <-- see the next section
+    return mean + posterior_var[t].sqrt() * torch.randn_like(xt)
+```
+
+**DDIM** takes a different route. Rather than sampling ancestrally, it predicts $x_0$, then re-noises it to the *previous* timestep — and how much fresh randomness it injects is a free parameter η:
+
+```{python}
+@torch.no_grad()
+def ddim_step(model, xt, t, t_prev, eta=0.0):
+    ab_t = abar[t]
+    ab_prev = abar[t_prev] if t_prev >= 0 else torch.tensor(1.0)
+    eps = model(xt, torch.full((xt.shape[0],), t, device=xt.device))
+
+    x0_pred = (xt - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()       # the identity from above
+    sigma = eta * (((1 - ab_prev) / (1 - ab_t)) * (1 - ab_t / ab_prev)).clamp(min=0).sqrt()
+    direction = (1 - ab_prev - sigma**2).clamp(min=0).sqrt() * eps
+
+    out = ab_prev.sqrt() * x0_pred + direction
+    return out if eta == 0 else out + sigma * torch.randn_like(xt)
+```
+
+The two knobs that follow from this are the whole reason DDIM matters.
+
+**η controls stochasticity.** At η=1 on *adjacent* timesteps the step variance matches DDPM's posterior, recovering the ancestral update; on a strided subsequence it gives the DDPM-like update for that subsequence rather than the original full chain. At η=0 the noise term vanishes and the sampler becomes a deterministic map from the initial latent to the image:
+
+```{python}
+def _sigma(ab_t, ab_prev, eta):
+    return eta * (((1 - ab_prev)/(1 - ab_t)) * (1 - ab_t/ab_prev)).clamp(min=0).sqrt()
+
+for eta in (0.0, 0.5, 1.0):
+    print(f"η = {eta}:  σ = {_sigma(abar[500], abar[450], eta):.4f}")
+```
+
+```{python}
+# A real determinism test runs the whole LOOP twice from a fixed latent.
+# (Calling one pure function twice would prove nothing.)
+def toy_eps(xt, t):                      # stand-in for the network: deterministic, stateful-free
+    return torch.tanh(xt * (1 + t / T))
+
+def sample_loop(x, steps, eta, seed=0):
+    torch.manual_seed(seed)              # only matters when eta > 0
+    for t, t_prev in zip(steps[:-1], steps[1:]):
+        ab_t = abar[t]
+        ab_prev = abar[t_prev] if t_prev >= 0 else torch.tensor(1.0)   # ᾱ=1 at the endpoint
+        eps = toy_eps(x, t)
+        x0p = (x - (1 - ab_t).sqrt() * eps) / ab_t.sqrt()
+        sig = _sigma(ab_t, ab_prev, eta)
+        x = ab_prev.sqrt() * x0p + (1 - ab_prev - sig**2).clamp(min=0).sqrt() * eps
+        if eta > 0:
+            x = x + sig * torch.randn_like(x)
+    return x
+
+steps = torch.linspace(999, 0, 20).round().long().tolist() + [-1]   # -1 = the clean endpoint
+x_init = torch.randn(2, 8)
+
+a = sample_loop(x_init.clone(), steps, eta=0.0)
+b = sample_loop(x_init.clone(), steps, eta=0.0)
+assert torch.equal(a, b)
+print("η=0: identical latent → identical output, over the full loop  ✓")
+
+c = sample_loop(x_init.clone(), steps, eta=1.0, seed=1)
+d = sample_loop(x_init.clone(), steps, eta=1.0, seed=2)
+assert not torch.equal(c, d)
+print("η=1: same latent, different RNG → different output  ✓")
+```
+
+**And the steps don't have to be adjacent.** `ddim_step` takes `t` and `t_prev` as separate arguments, so nothing requires `t_prev = t-1`. You can stride through the schedule:
+
+```{python}
+def ddim_model_timesteps(n_steps, T=1000):
+    """The n_steps timesteps at which the network is evaluated, descending.
+    Append -1 before looping: that final transition targets the clean endpoint (ᾱ=1)
+    and costs no extra network call."""
+    return torch.linspace(T - 1, 0, n_steps).round().long().tolist()
+
+print("50-step DDIM evaluates at:", ddim_model_timesteps(50)[:6], "...",
+      ddim_model_timesteps(50)[-3:], "then steps to -1")
+print(f"\nnetwork evaluations: DDPM {T}, DDIM(50) 50  →  {T//50}× fewer")
+```
+
+That's the practical headline. Same weights, same training objective and noise marginals, a different reverse trajectory, and 20× fewer network evaluations.
+
+## Break it: sampling noise at the terminal step
+
+DDPM's reverse step needs a variance, and the paper offers two choices: $\sigma_t^2 = \beta_t$, or the true posterior variance
+
+$$\tilde\beta_t = \beta_t\,\frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}$$
+
+Both are legitimate — DDPM presents them as fixed-large and fixed-small, and reports comparable sample quality. What is *not* optional is what happens at the final step.
+
+```{python}
+print(f"{'t':>6} {'β_t':>12} {'β̃_t':>12}   ratio")
+for t in [0, 1, 10, 100, 999]:
+    r = (posterior_var[t] / betas[t]).item() if betas[t] > 0 else 0
+    print(f"{t:>6} {betas[t]:>12.3e} {posterior_var[t]:>12.3e}   {r:>6.3f}")
+```
+
+Look at `t = 0`. The posterior variance is **exactly zero** — because $\bar\alpha_{-1} = 1$ by definition, so the numerator vanishes. That's the right answer: at the final step there is no remaining uncertainty to sample, and $\tilde\beta$ encodes that automatically. The fixed-large choice does not, so with $\beta_t$ the terminal noise has to be suppressed explicitly — which is exactly why reference implementations carry a `t == 0` special case:
+
+```{python}
+print(f"σ from β̃ at t=0:  {posterior_var[0].sqrt():.4f}   (zero by construction)")
+print(f"σ from β  at t=0:  {betas[0].sqrt():.4f}   (must be masked explicitly)")
+print(f"\nimages live in [-1, 1], so that second one is ~{betas[0].sqrt()/2*100:.1f}% "
+      f"of the full range, on every pixel of every sample")
+```
+
+Half a percent of the dynamic range barely moves a loss curve. What it looks like is a faint uniform speckle across every sample, which reads as "my model isn't trained enough" rather than as a variance you picked. The tell is that it's identical in character across every image and doesn't improve with more training.
+
+**A note on my own code above**, because I got this wrong first. My `ddpm_step` has an explicit `if t == 0: return mean` guard, and I originally wrote this section claiming that removing it would produce the grain. It wouldn't — with $\tilde\beta$, `posterior_var[0]` is already exactly zero, so on *this* implementation the guard is redundant. The failure is real but it belongs to the fixed-large variance, where the guard is load-bearing rather than decorative. Keep it either way: it states the intent, and it protects you the moment you switch.
+
+The same class of error, harder to spot: **an off-by-one in the schedule indexing.** If your sampler reads `abar[t]` where the derivation calls for `abar[t-1]`, every step is computed against a slightly wrong noise level. Samples still form — the process is self-correcting enough to produce something image-like — they're just consistently worse, and no amount of training fixes it. Both bugs share the signature this series keeps finding: correct shapes, no exception, plausible output, and a quality ceiling you'll blame on the architecture.
+
+## Train it
+
+The analytical parts above run anywhere. Training needs a GPU — a small UNet on MNIST is well within a free Colab tier, though I'm not going to quote a runtime I haven't measured on the machine you'll use.
+
+```python
+# Colab. See the notebook for the UNet definition.
+model = UNet(ch=64).cuda()
+opt = torch.optim.AdamW(model.parameters(), lr=2e-4)
+
+for epoch in range(20):
+    for x0, _ in loader:                        # MNIST, scaled to [-1, 1]
+        loss = diffusion_loss(model, x0.cuda())
+        opt.zero_grad(); loss.backward(); opt.step()
+
+# then: 1000-step DDPM vs 50-step DDIM, same weights
+ddpm_samples = sample_ddpm(model, n=16)
+ddim_samples = sample_ddim(model, n=16, steps=50, eta=0.0)
+```
+
+**What to look for**, since this is the experiment the post is built around: sweep the DDIM step count and find where quality visibly departs from the 1000-step DDPM baseline. DDIM's claim is that you can take far fewer steps for comparable quality; **where the crossover sits is model- and schedule-specific**, so it's a number to measure rather than one to take from here or from the paper. Compare the two as distributions, not image-by-image — DDPM injects fresh noise at every step, so the same initial latent gives you no reason to expect the same digit.
+
+## What to carry away
+
+- **The forward process is fixed and closed-form.** No parameters, and one line jumps to any timestep — which is the only reason training is cheap.
+- **The network predicts ε.** The target has fixed marginal scale at every timestep, and an unweighted ε-MSE induces one particular weighting across SNR. Other parameterisations are equally valid; they weight the errors differently.
+- **The sampler is a separate choice from the model.** DDPM and DDIM read the same weights; they differ only in how they step. η interpolates between them, and η=0 makes generation a deterministic function of the latent.
+- **DDIM's steps needn't be adjacent**, which is where the 20× speedup comes from — not from a better model, from evaluating the network at fewer of the same noise levels.
+- **The final step must not add noise**, and forgetting it costs you a uniform speckle that looks like an undertrained model rather than a one-line bug.
+
+If one sentence survives: *training teaches the network a single thing — what noise was added — and everything else you've heard about diffusion is a decision about how to walk backwards using that one answer.*
+
+## Where this goes next
+
+Two things are conspicuously missing. This model generates *a* digit, with no way to ask for a particular one — conditioning, and the guidance that makes it work, is the next post. And the schedule was taken from the paper without justification — which turns out to decide how a fixed budget of timesteps is distributed across noise levels, and the linear and cosine schedules distribute it very differently.
+
+## References
+
+- Ho, Jain & Abbeel, [*Denoising Diffusion Probabilistic Models*](https://arxiv.org/abs/2006.11239), 2020 — the ε-parameterisation and the simplified loss used above.
+- Song, Meng & Ermon, [*Denoising Diffusion Implicit Models*](https://arxiv.org/abs/2010.02502), 2020 — the non-Markovian family, η, and strided sampling.
+- Luo, [*Understanding Diffusion Models: A Unified Perspective*](https://arxiv.org/abs/2208.11970), 2022 — the derivation at length, if you want the ELBO route.
+- Hugging Face [`diffusers` schedulers](https://github.com/huggingface/diffusers/tree/main/src/diffusers/schedulers) — what production implementations actually do with the variance choice, the β clamp, and strided timesteps.

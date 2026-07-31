@@ -17,6 +17,7 @@ website:
       - agentic.qmd
       - architectures.qmd
       - llm-systems.qmd
+      - generative.qmd
     right:
       - about.qmd
       - text: Portfolio

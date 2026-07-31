@@ -1,11 +1,9 @@
 ---
-title: "🎨 Generative"
+title: "🌀 Diffusion"
+listing-page: true
 listing:
-  contents:
-    - notes/generative/**/*.qmd
-    - "!notes/generative/**/index.qmd"
+  contents: .
   type: default
-  categories: true
   sort: "date desc"
   sort-ui: false
   filter-ui: false
@@ -16,4 +14,4 @@ page-layout: full
 title-block-banner: true
 ---
 
-Diffusion, GANs/VAEs, vision-language models, and world models - generating pixels, video, and more.
+Forward and reverse processes, guidance, and the noise schedule - how a denoiser turns into a sampler you can control.

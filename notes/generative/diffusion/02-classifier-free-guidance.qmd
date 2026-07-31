@@ -1,0 +1,142 @@
+---
+title: "Classifier-Free Guidance Is Extrapolation, Not Interpolation"
+description: "CFG computes what the model predicts with your prompt and without it, then pushes past the conditional prediction rather than blending toward it. That's why turning the knob up keeps working — until it very visibly doesn't, with no error and no warning."
+categories: [generative, diffusion]
+date: 2026-07-30
+depth: "Note"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+The model from the [previous post](01-diffusion-from-scratch.qmd) generates *a* digit. There's no way to ask for a seven.
+
+The obvious fix — train on `(image, label)` pairs and feed the label in — works, and on a small model like this one the conditional samples tend to follow the label less strongly than you'd like. How much that matters depends on the model and the conditioning signal; it is not a universal property of conditional diffusion. Most practical text-to-image systems do something else on top, and the something else is one line:
+
+$$\hat\epsilon = \epsilon_\theta(x_t, \varnothing) + w \cdot \big(\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \varnothing)\big)$$
+
+> **Read that as a vector, not a formula.** $\epsilon_c - \epsilon_\varnothing$ is the direction the prompt pulls the prediction in. CFG starts from the *unconditional* prediction and travels along that direction — and at $w > 1$ it travels **further than the conditional prediction actually went.** It is extrapolation. That's the central mechanism, and it explains one important high-guidance failure mode.
+
+> **TL;DR** — One model is trained to handle both conditional and unconditional prediction by randomly dropping the condition during training. At sample time you evaluate it twice and extrapolate along the difference. $w=1$ is ordinary conditional sampling; $w=0$ ignores the prompt; $w>1$ overshoots on purpose, trading diversity for fidelity to the prompt. Push it too far and the guided prediction's norm grows roughly linearly in $w$ — shown below on synthetic vectors — which amplifies the conditional–unconditional difference and can push the denoising trajectory out of distribution. Cost: two forward passes per step instead of one.
+
+## Training: one model, two jobs
+
+The trick that makes this "classifier-free" is that you don't train a separate unconditional model. You train one model and randomly discard the condition:
+
+```python
+def cfg_loss(model, x0, cond, p_drop=0.1):
+    t = torch.randint(0, T, (x0.shape[0],), device=x0.device)
+    noise = torch.randn_like(x0)
+    xt = q_sample(x0, t, noise)
+
+    # drop the condition ~10% of the time -> the model learns both the unconditional
+    # and the conditional denoising prediction
+    mask = torch.rand(cond.shape[0], device=cond.device) < p_drop
+    cond = cond.masked_fill(mask, NULL_TOKEN)
+
+    return F.mse_loss(model(xt, t, cond), noise)
+```
+
+The conditioning path itself is the real work — a null embedding the model can learn, and an architecture that consumes `cond` — but once the conditioning path exists, the CFG-specific change to the training procedure is the one masked_fill — the MSE objective itself is unchanged. The model then answers two questions with one set of weights, which is what lets you take their difference at sample time.
+
+## Sampling: the extrapolation
+
+```{python}
+import torch
+torch.manual_seed(0)
+
+def guided_eps(eps_cond, eps_uncond, w):
+    """CFG. Note this is NOT a blend — at w>1 it goes past eps_cond."""
+    return eps_uncond + w * (eps_cond - eps_uncond)
+```
+
+Three values are worth knowing by name, and the third is where the confusion lives:
+
+```{python}
+ec, eu = torch.randn(1, 64), torch.randn(1, 64)
+for w, label in [(0.0, "ignores the prompt entirely"),
+                 (1.0, "ordinary conditional sampling"),
+                 (3.0, "past the conditional prediction")]:
+    g = guided_eps(ec, eu, w)
+    to_c = (g - ec).norm() / ec.norm()
+    print(f"w = {w:>4}  {label:<32} distance from ε_c: {to_c:.2f}")
+```
+
+At $w=1$ the formula collapses to $\epsilon_c$ exactly — the unconditional terms cancel. Below 1 you're interpolating *between* unconditional and conditional. Above 1 you've left the segment between them and are extending the line beyond $\epsilon_c$, which is the regime in which CFG is commonly used. The original Stable Diffusion v1 script used 7.5 as its default, which remains the default in the Diffusers Stable Diffusion pipeline.
+
+## Break it: why large w stops working
+
+One reason CFG degrades isn't mysterious once you look at what happens to the magnitude of the thing you're feeding back into the model:
+
+```{python}
+torch.manual_seed(1)
+ec, eu = torch.randn(1, 256), torch.randn(1, 256)
+
+print(f"{'w':>5} {'‖ε̂‖':>10} {'vs ‖ε_c‖':>12}")
+for w in [1, 3, 5, 7.5, 10, 15, 20]:
+    g = guided_eps(ec, eu, w)
+    print(f"{w:>5} {g.norm():>10.1f} {g.norm()/ec.norm():>11.1f}×")
+```
+
+**In this deliberately worst-case geometry, the norm grows roughly linearly in $w$.** `ec` and `eu` here are *independent* Gaussians, which maximises the difference between them. A trained model's conditional and unconditional predictions come from the same network and are usually far more aligned, so the numerical factors above should not be read as measurements of anything trained — what they show is the shape of the dependence on $w$.
+
+The mechanism that follows is the part worth carrying: the guided prediction feeds the $x_0$ estimate, so as it grows the estimate moves further from the region the model represented during training. Nothing raises, the sampler runs identically, and the result degrades in a way that's easy to mistake for the model's ceiling.
+
+```{python}
+# Propagate the overshoot through the actual x₀ identity rather than assuming a factor:
+#   x₀ = (x_t − √(1−ᾱ)·ε̂) / √ᾱ        so a larger ‖ε̂‖ moves x₀ further, by √(1−ᾱ)/√ᾱ.
+torch.manual_seed(2)
+abar_t = torch.tensor(0.30)                      # a mid-trajectory timestep
+x0_true = (torch.randn(4096) * 0.4).clamp(-1, 1) # in-range by construction, as an image is
+eps_c   = torch.randn(4096)
+eps_u   = torch.randn(4096)
+xt = abar_t.sqrt()*x0_true + (1-abar_t).sqrt()*eps_c    # x_t consistent with ε_c
+
+for w in [1, 3, 7.5, 15]:
+    eps_hat = guided_eps(eps_c, eps_u, w)
+    x0_est  = (xt - (1-abar_t).sqrt()*eps_hat) / abar_t.sqrt()
+    out = (x0_est.abs() > 1 + 1e-4).float().mean()   # tolerance: ignore float round-trip at the boundary
+    print(f"w = {w:>4}:  std(x̂₀) = {x0_est.std():5.2f}   {out:6.1%} of values outside [-1, 1]")
+```
+
+**Read this as geometry, not as a measurement.** `eps_c` and `eps_u` here are independent Gaussians, which is the worst case — a trained model's conditional and unconditional predictions are strongly *correlated*, so their difference is far smaller and real degradation sets in much later than these numbers suggest. What the demonstration establishes is the mechanism and its direction: at $w=1$ the estimate reproduces the clean sample exactly and nothing clips; above it, the $\sqrt{1-\bar\alpha}/\sqrt{\bar\alpha}$ factor amplifies the guidance term into the $x_0$ estimate, and an increasing fraction of it leaves the valid range.
+
+Two caveats on where that range even applies. Many pixel-space implementations explicitly clip or threshold $x_0$ estimates to $[-1,1]$, so there the failure is literal clipping. Latent-space models like Stable Diffusion have no such box — there the same overshoot pushes latents into regions the decoder never saw, which can appear after decoding as saturation, excessive contrast, or other guidance artefacts.
+
+The standard repairs attack magnitude rather than direction. **Rescaling** the guided prediction toward the conditional's statistics; **dynamic thresholding** (Imagen), which computes a high percentile $s$ of $|x_0|$ per step, clips to $[-s, s]$ and divides by $s$ — note it renormalises by the percentile, not to unit variance; and **guidance schedules** that vary $w$ over the trajectory rather than holding it fixed. Which direction the schedule should run is an empirical question and implementations differ, so treat "large early, small late" as one option rather than the rule.
+
+## The cost
+
+```{python}
+steps = 50
+print(f"unguided: {steps} network evaluations")
+print(f"CFG:      {steps*2} network evaluations   ({steps*2/steps:.0f}× the compute)")
+print("\n(batched as one invocation of size 2N — latency depends on utilisation)")
+```
+
+Two model evaluations per step, every step — usually batched into one forward invocation of size 2N. That's still roughly twice the network work; whether latency comes in under 2× depends on whether the larger batch improves utilisation, which is hardware-, shape- and memory-dependent. Removing it is what guidance distillation is for: training a student to reproduce the guided output in a single evaluation, which is one of the levers behind few-step samplers.
+
+## What to carry away
+
+- **CFG is extrapolation.** It starts at the unconditional prediction and travels *past* the conditional one. $w=1$ is plain conditional sampling; CFG is commonly used above it.
+- **One model, not two.** Randomly dropping the condition ~10% of the time during training teaches it both conditional and unconditional denoising predictions.
+- **Magnitude is one important failure mechanism.** The guided prediction's norm grows about linearly with $w$, pushing $x_0$ estimates off the manifold and into clipping or out-of-distribution latents. It is not the only thing going wrong at high guidance — mode-seeking behaviour costs diversity independently of any clipping — but it is the part you can see and the part the standard fixes target.
+- **The repairs rescale rather than reverse.** Prediction rescaling, dynamic thresholding, and guidance schedules all keep the extrapolation and fix its scale.
+- **It roughly doubles the network work per step**, though the two predictions are commonly batched into one invocation — which is why distilling guidance away is worth doing.
+- **Conventions differ.** Some codebases write the scale as $\epsilon_c + s(\epsilon_c - \epsilon_\varnothing)$, where $s = w - 1$. Check which one a repository means before comparing numbers.
+
+If one sentence survives: *guidance works by overshooting on purpose, and it fails when the overshoot leaves the space the model was trained to understand.*
+
+## Where this goes next
+
+Both posts so far took the noise schedule straight from the DDPM paper without comment. It turns out to control how a fixed budget of timesteps is spread across noise levels — and the linear and cosine schedules spread it very differently, which is the subject of the next note.
+
+## References
+
+- Ho & Salimans, [*Classifier-Free Diffusion Guidance*](https://arxiv.org/abs/2207.12598), 2022 — the original.
+- Dhariwal & Nichol, [*Diffusion Models Beat GANs*](https://arxiv.org/abs/2105.05233), 2021 — classifier guidance, the classifier-based counterpart that CFG avoids.
+- Saharia et al., [*Imagen*](https://arxiv.org/abs/2205.11487), 2022 — dynamic thresholding, for controlling saturation at high guidance scales.
+- Meng et al., [*On Distillation of Guided Diffusion Models*](https://arxiv.org/abs/2210.03142), 2022 — removing the 2× cost.
