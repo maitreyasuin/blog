@@ -1,0 +1,634 @@
+---
+title: "Accelerated Diffusion: Why an Exact Model Still Fails in One Step"
+description: "You are integrating a curved path. A one-step Euler sampler can still collapse even when the velocity field is exact. The reason is not a bad network but a bad long-range approximation. This chapter separates five different ways to make diffusion fast: better solvers, straighter trajectories, learned finite-time maps, distribution-level objectives, and systems work that reduces the cost of each model evaluation."
+categories: [generative, diffusion]
+date: 2026-08-01
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+Take the **exact** velocity field—not a neural approximation—and integrate it from noise to data with one Euler step.
+
+The target below is a two-dimensional mixture of Gaussians centred at \((-2,0)\) and \((2,0)\). Because the field is available in closed form, the experiment cleanly separates **model error** from **integration error**.
+
+```{python}
+import math
+import torch
+torch.manual_seed(0)
+
+A, S = 2.0, 0.35
+MU = torch.tensor([[-A, 0.0], [A, 0.0]])  # two data modes
+
+def posterior_mean_x(z, t):
+    """E[x | z_t] for z_t = (1-t)x + tε and a two-component Gaussian mixture."""
+    t = torch.as_tensor(t, dtype=z.dtype, device=z.device)
+    mu = MU.to(z)
+
+    marginal_var = (1 - t)**2 * S**2 + t**2
+    residual = z[:, None, :] - (1 - t) * mu
+    component_logits = -0.5 * residual.square().sum(-1) / marginal_var
+    component_prob = torch.softmax(component_logits, dim=1)
+
+    posterior_precision = 1 / S**2 + (1 - t)**2 / t**2
+    posterior_mean_per_component = (
+        mu / S**2 + (1 - t) * z[:, None, :] / t**2
+    ) / posterior_precision
+
+    return (component_prob[..., None] * posterior_mean_per_component).sum(1)
+
+def velocity(z, t):
+    """Exact marginal velocity E[ε - x | z_t]."""
+    t = torch.as_tensor(t, dtype=z.dtype, device=z.device).clamp(min=1e-3)
+    ex = posterior_mean_x(z, t)
+    eps_mean = (z - (1 - t) * ex) / t
+    return eps_mean - ex
+
+T_START, T_END = 1.0, 1e-3
+
+def integrate(z, n_steps, method="euler"):
+    ts = torch.linspace(T_START, T_END, n_steps + 1, device=z.device)
+    for i in range(n_steps):
+        t, t_next = ts[i], ts[i + 1]
+        h = t_next - t
+        v = velocity(z, t)
+
+        if method == "euler":
+            z = z + h * v
+        elif method == "heun":
+            z_predict = z + h * v
+            z = z + h * 0.5 * (v + velocity(z_predict, t_next))
+        else:
+            raise ValueError(f"unknown method: {method}")
+    return z
+```
+
+```{python}
+z_noise = torch.randn(4000, 2)
+reference = integrate(z_noise.clone(), 4000, "heun")
+one_step = integrate(z_noise.clone(), 1, "euler")
+
+def near_a_mode(x):
+    distance = torch.cdist(x, MU.to(x)).min(1).values
+    return (distance < 3 * S).float().mean()
+
+print(f"reference: {near_a_mode(reference):.1%} of samples near a mode")
+print(f"1-step Euler: {near_a_mode(one_step):.1%} near a mode, "
+      f"coordinate std {one_step.std(0).tolist()}")
+```
+
+The one-step result does not merely lose detail. It collapses close to the global mean.
+
+The field was exact, but it was only a **local derivative**. At \(t=1\), under the independent noise–data coupling, the local posterior mean is identical for every seed and carries no mode-specific assignment, so the initial velocity cannot encode the complete long-range transport map. One Euler step extends that initial tangent across the entire interval and lands in the wrong place.
+
+This is a deliberately clean failure case, not a claim that every one-step Euler sampler collapses. Its purpose is narrower and more useful:
+
+> **An exact local vector field does not imply an accurate large jump.**
+
+That observation separates the main acceleration strategies:
+
+1. **Integrate the same field better.**
+2. **Train a field with easier trajectories.**
+3. **Learn a finite-time jump instead of only an instantaneous derivative.**
+4. **Match the final distribution without preserving the teacher's path.**
+5. **Reduce the cost of each model evaluation through caching, quantization, kernels, or parallelism.**
+
+The fifth item is orthogonal to the first four—and is often the cheapest production win.
+
+> **TL;DR** — An exact local velocity field can still fail catastrophically in one large step. Fast generation therefore has several distinct solutions: integrate the field better, train straighter trajectories, learn finite-time maps, match the output distribution directly, or reduce the cost of each model evaluation. These solve different problems — and NFE alone does not predict product latency.
+
+## Why it lands on the mean, exactly
+
+"The tangent is a poor approximation of a curve" is true and unsatisfying. The real explanation is sharper, and it makes the rest of the post easier to reason about.
+
+The denoiser's job is to estimate $\mathbb{E}[x \mid z_t]$. Ask what that quantity *is* at the start of sampling. At $t=1$ the state is pure noise: $z_1$ is independent of $x$ by construction. An estimator conditioned on something carrying no information about the target can do no better than the unconditional mean — and it doesn't merely approach it, it equals it:
+
+```{python}
+def sample_marginal(n, t):
+    """Draw z_t from the true marginal: z_t = (1−t)·x + t·ε, with x from the data."""
+    x = MU[torch.randint(0, 2, (n,))] + S * torch.randn(n, 2)
+    return (1 - t) * x + t * torch.randn(n, 2), x
+
+z1, _ = sample_marginal(50_000, torch.tensor(1.0))
+denoised = posterior_mean_x(z1, torch.tensor(1.0))
+print("E[x | z₁] across 50,000 different noise samples:")
+print(f"   x-coordinate: min {denoised[:,0].min():.3e}   max {denoised[:,0].max():.3e}")
+print(f"   spread across all 50,000: {(denoised.max(0).values - denoised.min(0).values).max():.3e}")
+print("   the data mean is (0, 0)")
+```
+
+Zero spread. For fifty thousand different starting points, the model's best estimate of the clean sample is **the same point** — the mean of the dataset. So a single Euler step from $t=1$ isn't making a rough guess at the right answer; it is aiming, precisely and correctly, along the local derivative, and that derivative points at the average of the entire data distribution.
+
+The local estimate is not wrong. The failure is in treating it as a valid approximation to the full finite-time transport — which makes the collapse **discretisation error**, exactly as the opening framing claims, with the mechanism now visible.
+
+Which raises the question the rest of sampling exists to answer: where does the information come from?
+
+```{python}
+print(f"{'t':>6} {'std of E[x|z_t]':>17} {'corr. with the true x':>24}")
+for t in [1.0, 0.95, 0.9, 0.8, 0.6, 0.4, 0.2, 0.05]:
+    z, x = sample_marginal(20_000, torch.tensor(t))
+    ex = posterior_mean_x(z, torch.tensor(t))[:, 0]     # the informative coordinate
+    corr = (torch.corrcoef(torch.stack([ex, x[:, 0]]))[0, 1]
+            if ex.std() > 1e-6 else torch.tensor(0.0))
+    print(f"{t:>6.2f} {ex.std():>17.4f} {corr:>24.4f}")
+print(f"\n(the data's own standard deviation along x is {math.sqrt(A**2 + S**2):.3f})")
+```
+
+**Sample identity is resolved progressively by the reverse flow.** Not created — the randomness is entirely present in $z_1$ already, and a deterministic sampler adds none. What changes is that the nonlinear field gradually converts that seed into a mode and then an instance, and the local denoising estimate becomes correspondingly informative.
+
+The experiment above is a *forward-pair diagnostic*: it draws a fresh $(x, z_t)$ pair at each $t$ and asks how good the optimal estimate is at that noise level. That's the right measurement for "how much does the local estimate know," but it says nothing about a single trajectory. The sharper version follows one reverse path and asks how early the denoiser's estimate predicts *that path's own endpoint*:
+
+```{python}
+def reverse_trajectory(z, n_steps=600):
+    ts = torch.linspace(T_START, T_END, n_steps + 1)
+    path = [z.clone()]
+    for i in range(n_steps):
+        t, t_next = ts[i], ts[i + 1]
+        h = t_next - t
+        v = velocity(z, t)
+        z = z + h * 0.5 * (v + velocity(z + h * v, t_next))
+        path.append(z.clone())
+    return torch.stack(path), ts
+
+torch.manual_seed(0)
+P_probe, ts_probe = reverse_trajectory(torch.randn(2000, 2))
+endpoints = P_probe[-1][:, 0]
+
+# A single correlation would be misleading here: the modes sit 4 units apart, so it
+# would be dominated by getting the SIGN right. Decompose into mode and within-mode.
+endpoint_mode = torch.where(endpoints >= 0, torch.ones_like(endpoints),
+                            -torch.ones_like(endpoints))
+endpoint_residual = endpoints - endpoint_mode * A
+
+# Start at t=0.95, not t=1.00. At t=1 the estimate is exactly zero, so `est_residual`
+# below reduces to the mode label itself and neither column is meaningful there —
+# the "mode accuracy" would be a tie-break artefact of comparing 0.0 >= 0.
+print(f"{'t':>6} {'mode accuracy':>15} {'within-mode corr.':>20}")
+for t_target in [0.95, 0.90, 0.80, 0.60, 0.40, 0.20]:
+    k = int((ts_probe - t_target).abs().argmin())
+    est = posterior_mean_x(P_probe[k], ts_probe[k])[:, 0]
+
+    predicted_mode = torch.where(est >= 0, torch.ones_like(est), -torch.ones_like(est))
+    mode_accuracy = (predicted_mode == endpoint_mode).float().mean()
+
+    est_residual = est - endpoint_mode * A
+    residual_corr = (torch.corrcoef(torch.stack([est_residual, endpoint_residual]))[0, 1]
+                     if est_residual.std() > 1e-6 else torch.tensor(0.0))
+    print(f"{t_target:>6.2f} {mode_accuracy:>15.1%} {residual_corr:>20.4f}")
+```
+
+**Mode selection is essentially immediate; instance resolution is gradual.** By $t=0.95$ the local estimate already predicts the eventual mode for every trajectory — but the correlation of the *within-mode* residual is only 0.11 there, reaching 0.77 at $t=0.6$ and 0.90 at $t=0.4$.
+
+That decomposition matters, because a single correlation number would have hidden it: with the modes four units apart, total correlation is dominated by getting the sign right, and jumps to 0.89 at $t=0.95$ while almost nothing about the specific sample has been determined. The endpoint was fixed by the seed all along; what develops progressively is the local estimator's ability to predict it. **In this toy, the mode is resolved first and the within-mode residual gradually after** — a more checkable statement than "coarse structure first, detail later," which would need a real image model to support.
+
+One qualification before the consequences: "the data mean" is the unconditional mean here because the toy is unconditional. In a conditional model the corresponding quantity is $\mathbb{E}[x \mid c]$, and in a latent diffusion model it is a latent-space mean — not necessarily anything that looks like an averaged image when decoded.
+
+Three consequences worth carrying, because they reframe everything that follows:
+
+- **Uniform spacing in raw $t$ is rarely the best low-NFE default.** Useful step placement depends on where the chosen solver and parameterisation accumulate truncation error, which is generally nonuniform across noise levels — not solely on how fast $\mathbb{E}[x \mid z_t]$ moves. Karras-style sigma schedules encode this through a hand-designed discretisation; later work optimises the schedule for a particular model and solver.
+- **Under this coupling, curvature is not an unfortunate property of an otherwise-fine path — it *is* this process.** The marginal field must transition from a global estimate to mode-specific transport, and that transition is what bends the trajectory. Note the qualifier: reflow changes the *coupling* itself, which reduces the ambiguity and therefore the curvature — that's the subject of Response 1. The next section measures how much it bends; this one says why it must.
+- **A one-step model is not merely a better integrator of the same local field.** The seed $z_1$ does contain the information — it determines the output completely. What the *instantaneous field at $t=1$* does not contain is the long-range assignment from that seed to a particular mode, because under the independent noise–data coupling the local posterior mean is the same for every seed. A one-step model has to learn that finite-time assignment directly. That is a different learning problem, not a numerical one, which is why the methods in the second half of this post are trained rather than derived.
+
+## The scope: deterministic diffusion and flow sampling
+
+For a score-based diffusion model, the probability-flow ODE has the same time marginals as the corresponding diffusion process. Flow-matching models start directly from an ODE:
+
+$$
+\frac{dz}{dt}=v_\theta(z_t,t),
+\qquad
+z_1\sim\mathcal N(0,I),
+\qquad
+z_0\sim p_{\mathrm{data}}.
+$$
+
+A deterministic sampler integrates this field from noise to data. Ancestral samplers instead discretize a stochastic reverse process, so “sampling is ODE integration” should not be read as a universal statement about every sampler.
+
+For a **fixed trained field**, choosing timesteps and updates is a numerical-analysis problem. End-to-end sample quality still depends on the learned field, parameterisation, noise schedule, conditioning, and model architecture.
+
+## Better solvers: compare evaluations, not steps
+
+Euler uses one field evaluation per step. Heun uses two. A table that gives both methods the same number of *steps* is therefore not a fair speed comparison.
+
+Here is the useful comparison: equal **number of function evaluations** (NFE).
+
+```{python}
+print(f"{'NFE':>5} {'Euler error':>13} {'Heun error':>13}")
+for nfe in [2, 4, 8, 16, 32, 64, 128]:
+    euler = integrate(z_noise.clone(), nfe, "euler")
+    heun = integrate(z_noise.clone(), nfe // 2, "heun")
+
+    e_error = (euler - reference).norm(dim=1).mean()
+    h_error = (heun - reference).norm(dim=1).mean()
+    print(f"{nfe:>5} {e_error:>13.5f} {h_error:>13.5f}")
+```
+
+Read the first row before moving on, because it complicates the headline. **At two evaluations Heun is substantially worse than Euler** — not marginally, by more than a factor of two. Formal order is an *asymptotic* property: it describes behaviour as the step size shrinks. With one enormous predictor step, Heun's second evaluation lands at a badly misplaced point, and averaging in a bad estimate is worse than not correcting at all. "Higher order" is not a guarantee anywhere near one to four NFE, which is precisely the regime everyone cares about.
+
+
+At moderate budgets, the second-order method buys a large reduction in error. The asymptotic rates are also visible when the number of *steps* is doubled:
+
+```{python}
+def error(n_steps, method):
+    out = integrate(z_noise.clone(), n_steps, method)
+    return (out - reference).norm(dim=1).mean().item()
+
+print("error ratio after doubling the number of steps")
+print(f"Euler: {error(64, 'euler') / error(32, 'euler'):.2f} "
+      f"(first order predicts 0.50)")
+print(f"Heun : {error(64, 'heun') / error(32, 'heun'):.2f} "
+      f"(second order predicts 0.25)")
+```
+
+This is the training-free branch of acceleration: DDIM, DPM-Solver and DPM-Solver++, UniPC, DEIS, and the EDM/Karras solver family all reduce the number of expensive denoiser calls by using a better discretisation or a better parameterisation of the same trained process.
+
+### Builder detail: second order does not always mean two new calls
+
+Heun is a Runge–Kutta method: it spends two fresh evaluations per step. Multistep methods such as DPM-Solver++(2M) reuse predictions from previous steps, so after startup they can obtain second-order behaviour with only **one new network evaluation per step**.
+
+That distinction matters more than the order written in a paper. In production, compare:
+
+- denoiser evaluations;
+- whether old evaluations are reused;
+- memory required to retain solver state;
+- and actual wall-clock latency.
+
+The classical \(O(h)\) and \(O(h^2)\) rates are asymptotic. At one to four evaluations, the step is so large that formal order is a weak predictor; timestep placement, parameterisation, guidance, and field geometry dominate.
+
+## The geometric ceiling: the transport is not a chord
+
+The information argument says the trajectory *must* bend. This section measures how much, and the measurement has to be set up carefully — a one-dimensional toy cannot answer it at all, because every path in one dimension lies on a line, so any "deviation" you compute there is temporal nonlinearity rather than geometric curvature.
+
+Two dimensions give a usable picture: the maximum perpendicular distance from each trajectory to the chord joining its endpoints. Treat it as intuition rather than as the governing quantity — the next section gives the exact one, and this measure is only loosely predictive of per-sample error.
+
+```{python}
+def trajectory(z, n_steps=600):
+    ts = torch.linspace(T_START, T_END, n_steps + 1, device=z.device)
+    path = [z.clone()]
+
+    for i in range(n_steps):
+        t, t_next = ts[i], ts[i + 1]
+        h = t_next - t
+        v = velocity(z, t)
+        z_predict = z + h * v
+        z = z + h * 0.5 * (v + velocity(z_predict, t_next))
+        path.append(z.clone())
+
+    return torch.stack(path)
+
+P = trajectory(z_noise[:2000].clone())
+start, end = P[0], P[-1]
+direction = end - start
+direction_sq = direction.square().sum(-1).clamp_min(1e-8)
+
+# No clamp: we want the perpendicular distance to the chord LINE. Clamping to [0,1]
+# would give distance to the line segment instead, and ~18% of points here project
+# outside it — for those, the clamped distance is not perpendicular to anything.
+projection_fraction = (
+    ((P - start[None]) * direction[None]).sum(-1) / direction_sq[None]
+)
+
+projection = start[None] + projection_fraction[..., None] * direction[None]
+perpendicular_distance = (P - projection).norm(dim=-1)
+chord_length = direction.norm(dim=-1).clamp_min(1e-3)
+
+relative_bow = perpendicular_distance.max(0).values / chord_length
+print(f"mean maximum perpendicular deviation / chord length: "
+      f"{relative_bow.mean():.2f}")
+print(f"median: {relative_bow.median():.2f}")
+```
+
+```{python}
+#| fig-cap: "Exact trajectories in the two-dimensional toy. The dashed chords connect each noise sample to its endpoint; the curved paths are what the solver must actually follow."
+#| code-fold: true
+import matplotlib.pyplot as plt
+
+show = torch.linspace(0, P.shape[1] - 1, 24).long()
+plt.figure(figsize=(8, 5))
+
+for j in show:
+    plt.plot(P[:, j, 0], P[:, j, 1], linewidth=1)
+    plt.plot([start[j, 0], end[j, 0]],
+             [start[j, 1], end[j, 1]],
+             linestyle="--", linewidth=0.7, alpha=0.5)
+
+plt.scatter(start[show, 0], start[show, 1], marker=".", label="noise")
+plt.scatter(end[show, 0], end[show, 1], marker="x", label="data endpoint")
+plt.scatter(one_step[show, 0], one_step[show, 1], marker="+", label="1-step Euler")
+plt.axvline(0, linewidth=0.5)
+plt.axis("equal")
+plt.xlabel("$z_1$")
+plt.ylabel("$z_2$")
+plt.legend()
+plt.show()
+```
+
+In this toy, the path bends away from its chord by about one-fifth of the endpoint displacement on average.
+
+A solver can approximate that curved path more accurately, but it cannot make the **trained vector field itself** straighter. There is no universal 10-step floor—different models, schedules, and solvers behave differently—but training-free solvers eventually hit a model-dependent low-NFE limit.
+
+## The exact statement: instantaneous versus average velocity
+
+Curvature is the right intuition, but it is a proxy. There is an exact quantity here, and naming it makes every method in the second half of this post follow rather than surprise.
+
+One Euler step from $t=1$ to $t=0$ produces $z_1 + \Delta t \cdot v(z_1, 1)$. The true endpoint is $z_1 + \Delta t \cdot \bar v$, where $\bar v$ is the **average velocity** along the trajectory — displacement divided by elapsed time. Subtract:
+
+$$\text{one-step error} \;=\; |\Delta t| \cdot \lVert v(z_1, 1) - \bar v \rVert$$
+
+Not a bound, not an asymptotic rate. An identity:
+
+```{python}
+z_probe = torch.randn(3000, 2)
+endpoint_true = integrate(z_probe.clone(), 800, "heun")
+
+average_velocity = (endpoint_true - z_probe) / (T_END - T_START)
+instant_velocity = velocity(z_probe, torch.tensor(T_START))
+
+one_step_err = (z_probe + (T_END - T_START) * instant_velocity - endpoint_true).norm(dim=-1)
+predicted    = ((T_END - T_START) * (instant_velocity - average_velocity)).norm(dim=-1)
+
+print(f"max |actual error − predicted| over 3000 samples: "
+      f"{(one_step_err - predicted).abs().max():.2e}")
+print(f"correlation: {torch.corrcoef(torch.stack([one_step_err, predicted]))[0,1]:.10f}")
+```
+
+Which is worth pausing on, because it reorganises the whole problem. **A sampler's job is to estimate the average velocity, and all it is given is the instantaneous one.** Every method in this post is a different way to close that gap:
+
+- **Better solvers** estimate $\bar v$ by sampling $v$ at several points along the way and averaging cleverly. Heun's two evaluations are a two-point estimate of the mean; higher-order methods are better quadrature. This is why their error falls with step count and why they cannot reach one step — with one generic local evaluation a solver cannot in general recover the exact interval-average velocity without extra assumptions about the field, which is why one-step methods learn or impose additional finite-time structure instead.
+- **Straightening the path** attacks the other side: if $v$ is constant along the trajectory then $v(z_1,1) = \bar v$ exactly, the gap is zero, and one step is not approximately right but exact. That is precisely the zero we measured earlier.
+- **Learning the map** skips the estimation entirely by regressing the endpoint.
+
+And it explains why one method is named the way it is. **MeanFlow models the average velocity directly** — the quantity the identity says you actually need — rather than the instantaneous velocity that flow matching provides. Under that framing it isn't a clever trick for going fast; it is modelling the thing the error term is written in terms of. That eliminates *integration* error in the ideal case where the average velocity is predicted exactly — the learned approximation error remains, and is now the only error there is.
+
+The perpendicular deviation measured above is a useful picture of *why* the two velocities differ. This is the statement of *by how much*.
+
+## Response 1: make the path easier
+
+Rectified flow trains on linear conditional paths,
+
+$$
+z_t=(1-t)x_0+t\epsilon,
+\qquad
+u_t=\epsilon-x_0.
+$$
+
+The target velocity is constant along each sampled pair. The learned **marginal** field need not be straight, because many independently paired paths can pass through similar regions and the regression target averages their velocities.
+
+Reflow changes the coupling. It generates noise–sample pairs using an existing deterministic model, then retrains on those pairs. The new coupling is much less ambiguous, and the resulting trajectories can become straighter.
+
+A constant-velocity path makes the one-step point exactly:
+
+```{python}
+x_target = torch.stack(
+    [torch.where(z_noise[:, 0] >= 0, torch.tensor(A), torch.tensor(-A)),
+     torch.zeros_like(z_noise[:, 0])],
+    dim=1,
+)
+constant_velocity = z_noise - x_target
+one_step_straight = z_noise - constant_velocity
+
+print("maximum endpoint error:",
+      (one_step_straight - x_target).abs().max().item())
+```
+
+This example proves only the numerical statement: if the correct finite path has constant velocity, Euler is exact. Learning such a useful coupling at image scale is the modelling problem.
+
+## Response 2: learn finite-time transport
+
+An instantaneous field answers:
+
+> Which direction should I move **now**?
+
+A one-step generator must answer a harder question:
+
+> Where should I land after a **large interval**?
+
+Several modern families train that finite-time object directly.
+
+**Consistency models** map any point on a trajectory to a common endpoint. Multi-step consistency sampling can re-noise and apply the map again, which often improves quality over the strict one-step case. Continuous-time consistency work and Easy Consistency Tuning made training more stable and substantially cheaper.
+
+**Consistency trajectory models** extend the target from “the endpoint” to “any later point,” making the learned object closer to a general finite-time transition map.
+
+**Shortcut models** condition on the requested step size. One network can therefore learn a short local move or a large jump, rather than being tied to one fixed solver budget.
+
+**MeanFlow** predicts average velocity over an interval rather than instantaneous velocity. An exact identity relates average and instantaneous velocity and supplies the training target. If the model predicts the correct average velocity over \([t,r]\), the corresponding finite jump is the integral—not a tangent approximation.
+
+MeanFlow was trained from scratch without a teacher and reported 3.43 FID at 1-NFE on ImageNet \(256^2\). Improved MeanFlow later reported 1.72 FID and made guidance an explicit conditioning variable; pixel MeanFlow reported one-step latent-free generation at 2.22 FID on ImageNet \(256^2\) and 2.48 at \(512^2\). These are paper-reported numbers, not directly comparable rankings: architecture, training compute, data processing, guidance, and FID protocol differ across papers.
+
+**Flow map matching** provides the general object here: a *two-time map* $f(z_t, t, s)$ transporting between arbitrary noise levels. Its formalism unifies several learned few-step families — consistency models, consistency trajectory models, progressive distillation — under one construction. The same map can also be composed over several shorter intervals, which gives an adjustable quality–compute trade-off analogous to taking more solver steps. **Align Your Flow** is a strong current example of scaling the idea across the full time range. That framing makes the design axis explicit: what you choose is which pairs $(t,s)$ to train on and how to enforce consistency between them.
+
+## Response 3: optimize the output distribution
+
+Distillation need not preserve the teacher's pointwise noise-to-image mapping.
+
+**Distribution Matching Distillation (DMD/DMD2)** trains the student distribution to match a target distribution using score-based gradients. DMD2 removes the expensive teacher-pair regression dataset used by DMD, adds stabilisation and an adversarial loss, and supports multi-step students.
+
+**Adversarial Diffusion Distillation (ADD)** combines score distillation with an adversarial objective; SDXL-Turbo came from this line. **LADD** moves adversarial discrimination into latent generative features and produced the four-step SD3-Turbo. **Score identity Distillation (SiD)** derives a different score-based objective and has been extended to one- and few-step text-to-image generation.
+
+A recent direct one-step line goes further and does not begin from a diffusion teacher at all. MeanFlow and its successors learn finite-time transport from scratch; a May 2026 arXiv report, W-Flow, instead builds a one-step generator around a Wasserstein-gradient-flow objective and reports 1.29 FID on ImageNet \(256^2\).
+
+The current story is therefore **bifurcation, not replacement**:
+
+- If you own an expensive pretrained foundation model, distillation remains the natural route.
+- If you are training a new foundation model, direct one-step objectives are now credible competitors to multi-step diffusion and flow training.
+
+Hybrid methods remain active as well: for example, SANA-Sprint combines continuous-time consistency distillation with latent adversarial distillation to obtain a step-adaptive 1–4-step text-to-image model.
+
+## NFE is not latency
+
+This is the practical section most acceleration summaries omit.
+
+A useful first-order latency model is
+
+$$
+T_{\text{e2e}}
+=
+T_{\text{text}}
++
+N_{\text{eval}}\,T_{\text{denoiser}}
++
+T_{\text{VAE}}
++
+T_{\text{scheduler}}
++
+T_{\text{transfer}}.
+$$
+
+Reducing NFE only attacks one term.
+
+At 30–50 denoiser evaluations, the denoiser usually dominates. At one to four evaluations, fixed costs become visible:
+
+- text encoding;
+- VAE decoding;
+- host-side scheduler logic and synchronization;
+- tensor transfers;
+- kernel-launch overhead;
+- compilation and warm-up;
+- safety and post-processing.
+
+A four-step model is not automatically four times faster than a sixteen-step model. It may use a larger backbone, double the batch for CFG, decode a more expensive latent, or run at a shape that under-utilizes the GPU.
+
+### Guidance changes the accounting
+
+Ordinary CFG needs conditional and unconditional predictions. Concatenating them into one batch may make this one framework invocation, but it still performs roughly twice the denoiser work and can increase memory pressure. A “4-step” model with ordinary CFG is often closer to **8 sample-equivalent evaluations** than four.
+
+Distilled and direct one-step models frequently bake guidance into training or condition on a guidance variable. Their `guidance_scale` is therefore not guaranteed to mean the same thing as the teacher's CFG scale.
+
+### Caching only exists when there are repeated steps
+
+Cross-step feature caching exploits temporal redundancy. DeepCache, TeaCache, FasterCache, and later DiT caching methods can skip layers, blocks, or tokens when neighbouring timesteps are similar.
+
+This composes well with a 20-step sampler. It has almost nothing to reuse in a strict one-step model.
+
+That is a useful deployment rule:
+
+> **As NFE falls, the value of cross-step caching falls; the value of quantization, kernels, and fixed-overhead optimization rises.**
+
+### Multi-GPU speedups solve a different problem
+
+DistriFusion and PipeFusion reduce latency for large high-resolution models by distributing patches and layers across devices, reusing stale neighbouring-step features to hide communication. They do not reduce NFE; they reduce the cost of each NFE and increase the memory available to the model.
+
+## Failure modes builders actually see
+
+### 1. The solver is incompatible with the checkpoint
+
+A scheduler is not a universally interchangeable dropdown. Prediction type (\(\epsilon\), \(v\), \(x_0\)), noise parameterisation, sigma convention, timestep spacing, terminal SNR, and model preconditioning must agree. A solver can run and return images while still being miscalibrated.
+
+### 2. A second-order label hides the real cost
+
+Heun spends two new evaluations per step. A second-order multistep solver may spend one. Count **new denoiser calls**, not the order of the method and not only the number of scheduler loop iterations.
+
+### 3. Guidance was trained in, then applied again
+
+Turbo and consistency checkpoints often expect weak or zero external CFG. Applying the teacher's usual scale can oversaturate or destabilize the sample because the student already learned a guided map.
+
+### 4. Aggregate FID misses conditional diversity loss
+
+FID can reveal severe global mode collapse, but it can still look acceptable while seed-to-seed variation for a fixed prompt shrinks. For text-to-image systems, evaluate prompt-conditioned diversity separately—for example with pairwise LPIPS or DINO-feature dispersion across many seeds—alongside prompt alignment and human preference.
+
+### 5. Distillation does not automatically preserve the teacher
+
+A pointwise regression student is strongly tied to the teacher's mapping, but adversarial and distribution-level losses can move away from it. This can correct some teacher weaknesses or create new failure modes. “Distilled” does not mean “behaviourally identical.”
+
+### 6. Paper speedup is not product speedup
+
+Report at least:
+
+- warm and cold latency;
+- batch-1 latency and saturated throughput;
+- p50 and p95;
+- resolution and aspect ratio;
+- dtype and quantization;
+- CFG mode and effective denoiser work;
+- text encoder and VAE included or excluded;
+- compile time excluded or amortized;
+- identical prompt/seed sets and evaluation protocol.
+
+Without that information, “4× faster” is usually not reproducible.
+
+### 7. Low-NFE models have fewer chances to repair approximation error
+
+Quantization, caching and numerical shortcuts that are harmless in a fifty-step sampler can become visible at one or two. A multi-step trajectory has later denoising stages that can partially absorb an imperfect intermediate update; a strict one-step generator has nowhere to recover. **Revalidate precision and approximation settings after reducing NFE** rather than inheriting the teacher's — a configuration that was safe at 50 steps has not been tested at 2.
+
+### 8. Adaptive NFE is often the wrong trade in production
+
+Adaptive solvers cut the *average* evaluations per sample, which looks like a clear win offline. In a serving system it frequently isn't, and the two ways of implementing it fail differently. **Per-sample adaptivity** fragments the batch and creates divergent execution. **A shared adaptive controller** preserves batching but lets the hardest sample in the batch set the schedule for everyone. Either can lose to a fixed four-step policy that batches predictably, even when the adaptive method uses fewer evaluations on average. The second failure is the [continuous batching post's](../../llm-systems/inference/continuous-batching/03-continuous-batching.qmd) convoy, arriving in a different costume.
+
+### The budget is not always an integer
+
+Two recent directions widen what "the budget" even means. **1.x-Distill** explores fractional effective NFE with cache-aware distillation, and **MrFlow** stages low- and high-resolution sampling to cut spatial compute, composing with timestep distillation rather than replacing it. Both are recent preprints and should be read as such — but they reinforce the practical point this section has been building toward: acceleration is not a single "number of steps" knob.
+
+## What is actually useful in practice
+
+| Starting point | First move | Why | Main caveat |
+|---|---|---|---|
+| Existing diffusion/flow checkpoint | compatible DPM-Solver++/UniPC/DEIS + tuned timestep spacing | no retraining | model-dependent low-NFE floor |
+| Large multi-step U-Net or DiT | feature caching | training-free reduction in work per NFE | approximation error accumulates |
+| Existing checkpoint needing 4–8 steps | LCM/consistency adapter or targeted distillation | preserves most of the ecosystem | guidance and schedule become checkpoint-specific |
+| Fixed production model at 1–4 steps | DMD/ADD/LADD/SiD-style distillation | strongest commitment to latency | expensive training and possible diversity drift |
+| New foundation model | shortcut/MeanFlow/direct one-step objective | no teacher ceiling or synthetic-pair pipeline | full training risk; benchmarks are still moving |
+| Any of the above | quantization, compilation, fused kernels, parallelism | reduces cost per evaluation | hardware- and shape-dependent |
+
+For a pretrained model that must become faster this week:
+
+1. verify the scheduler and prediction parameterisation;
+2. tune timestep spacing at equal NFE;
+3. profile denoiser versus text encoder and VAE;
+4. add caching if many steps remain;
+5. quantize or compile the true bottleneck;
+6. distil only when the free and post-training options no longer meet the target.
+
+## What to carry away
+
+- **The one-step error is an identity, not a bound:** |Δt|·‖v(z₁,1) − v̄‖, the gap between the instantaneous velocity you are given and the average velocity you need. Solvers estimate v̄ by sampling v repeatedly; straightening makes the two equal; MeanFlow models v̄ directly, which removes the integration error in the ideal case and leaves learned approximation error as the only remaining source.
+- **The collapse is not model error; it is finite-step integration error.** At $t=1$ the local estimate is exactly the dataset mean — zero spread across fifty thousand samples — because under the independent coupling the state carries no mode information. What fails is extrapolating that correct local derivative across the whole interval.
+- **An exact field can still fail in one step.** A local derivative is not a finite-time transport map.
+- **Compare equal NFE, not equal steps.** Then compare wall clock, because NFE still is not latency.
+- **Formal order is not a cost model.** Runge–Kutta methods spend extra calls; multistep methods reuse old ones.
+- **Straightening and finite-time learning solve different problems.** Rectified flow defines linear conditional paths, and reflow changes the coupling so the learned marginal transport is straighter; consistency, shortcut, and MeanFlow-style methods learn larger jumps.
+- **From-scratch one-step training did not replace distillation.** It created a second frontier. Distillation still dominates when the asset to accelerate is an existing foundation model.
+- **Cross-step caching disappears at one step.** Quantization, kernels, the decoder, and other fixed costs then matter more.
+- **Metrics must expose conditional diversity and real latency.** FID and step count alone are not deployment evidence.
+
+If one sentence survives:
+
+> *You can reduce the number of points used to trace the path, train an easier path, learn the finite jump, or make every evaluation cheaper—but those are different engineering decisions with different failure modes.*
+
+## Where this goes next
+
+The natural follow-ups are:
+
+- **Flow matching**, deriving the conditional and marginal velocity fields used above.
+- **Video acceleration**, where temporal attention, long sequence lengths, CFG, and VAE cost make per-evaluation systems work as important as step reduction.
+- **Diffusion systems**, covering caching, quantization, compilation, attention kernels, and multi-GPU parallelism with measured wall-clock profiles.
+
+## References
+
+**Solvers and trajectories**
+
+- Song, Meng & Ermon, [*Denoising Diffusion Implicit Models*](https://arxiv.org/abs/2010.02502), 2020.
+- Zhang & Chen, [*Fast Sampling of Diffusion Models with Exponential Integrator*](https://arxiv.org/abs/2204.13902) (DEIS), 2022 — the exponential-integrator view, used twice above.
+- Lu et al., [*DPM-Solver*](https://arxiv.org/abs/2206.00927), 2022.
+- Lu et al., [*DPM-Solver++*](https://arxiv.org/abs/2211.01095), 2022.
+- Zhao et al., [*UniPC*](https://arxiv.org/abs/2302.04867), 2023.
+- Sabour et al., [*Align Your Steps: Optimizing Sampling Schedules in Diffusion Models*](https://arxiv.org/abs/2404.14507), 2024 — optimising step placement per model and solver.
+- Karras et al., [*Elucidating the Design Space of Diffusion-Based Generative Models*](https://arxiv.org/abs/2206.00364), 2022.
+- Liu, Gong & Liu, [*Flow Straight and Fast: Rectified Flow*](https://arxiv.org/abs/2209.03003), 2022.
+- Liu et al., [*InstaFlow*](https://arxiv.org/abs/2309.06380), 2023.
+
+**Finite-time maps and direct one-step training**
+
+- Song et al., [*Consistency Models*](https://arxiv.org/abs/2303.01469), 2023.
+- Kim et al., [*Consistency Trajectory Models*](https://arxiv.org/abs/2310.02279), 2023.
+- Geng et al., [*Consistency Models Made Easy*](https://arxiv.org/abs/2406.14548), 2024.
+- Lu & Song, [*Simplifying, Stabilizing and Scaling Continuous-Time Consistency Models*](https://arxiv.org/abs/2410.11081), 2024.
+- Frans et al., [*One Step Diffusion via Shortcut Models*](https://arxiv.org/abs/2410.12557), 2024.
+- Boffi et al., [*Flow Map Matching*](https://arxiv.org/abs/2406.07507) — the two-time map $f(z_t,t,s)$, whose formalism includes consistency models, consistency trajectory models, progressive distillation and neural-operator approaches as particular cases.
+- Sabour et al., [*Align Your Flow*](https://arxiv.org/abs/2506.14603), 2025 — flow maps across the full time range, and the training choices that make them work.
+- Geng et al., [*Mean Flows for One-Step Generative Modeling*](https://arxiv.org/abs/2505.13447), NeurIPS 2025 oral.
+- Geng et al., [*Improved Mean Flows*](https://arxiv.org/abs/2512.02012), 2025.
+- Lu et al., [*One-step Latent-free Image Generation with Pixel Mean Flows*](https://arxiv.org/abs/2601.22158), 2026.
+- Han et al., [*One-Step Generative Modeling via Wasserstein Gradient Flows*](https://arxiv.org/abs/2605.11755), 2026 arXiv preprint.
+
+**Distillation**
+
+- Salimans & Ho, [*Progressive Distillation*](https://arxiv.org/abs/2202.00512), 2022.
+- Meng et al., [*On Distillation of Guided Diffusion Models*](https://arxiv.org/abs/2210.03142), 2022.
+- Luo et al., [*Latent Consistency Models*](https://arxiv.org/abs/2310.04378), 2023.
+- Yin et al., [*Distribution Matching Distillation*](https://arxiv.org/abs/2311.18828), 2023.
+- Yin et al., [*DMD2*](https://arxiv.org/abs/2405.14867), 2024.
+- Sauer et al., [*Adversarial Diffusion Distillation*](https://arxiv.org/abs/2311.17042), 2023.
+- Sauer et al., [*Latent Adversarial Diffusion Distillation*](https://arxiv.org/abs/2403.12015), 2024.
+- Zhou et al., [*Score identity Distillation*](https://arxiv.org/abs/2404.04057), 2024.
+- Chen et al., [*SANA-Sprint*](https://arxiv.org/abs/2503.09641), 2025.
+
+**Systems acceleration**
+
+- Ma, Fang & Wang, [*DeepCache*](https://arxiv.org/abs/2312.00858), 2023.
+- Liu et al., [*TeaCache*](https://arxiv.org/abs/2411.19108), CVPR 2025.
+- Lv et al., [*FasterCache*](https://arxiv.org/abs/2410.19355), 2024.
+- Li et al., [*DistriFusion*](https://arxiv.org/abs/2402.19481), 2024.
+- Fang et al., [*PipeFusion*](https://arxiv.org/abs/2405.14430), 2024.
