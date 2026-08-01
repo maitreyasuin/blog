@@ -1,0 +1,314 @@
+---
+title: "Fewer Steps: Follow the Curve, Straighten It, or Skip It"
+description: "Three families of fast-sampling methods, derived rather than listed. Including the result that surprises people: a mathematically better solver can be twice as bad as a crude one when you only have two network calls to spend."
+categories: [generative, diffusion]
+date: 2026-08-02
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+[The previous post](04-why-fifty-steps.qmd) left us with a precise problem. The model provides a **local** velocity: how the current noisy state should change right now. A large sampling step needs the **average** velocity over a whole interval. Those differ whenever the velocity changes along the path—because the path bends, the speed changes, or both.
+
+There are three geometric responses:
+
+1. **Integrate the changing field better.** Keep the model and estimate the interval more accurately.
+2. **Train an easier field.** Make the velocity vary less along typical trajectories.
+3. **Learn the finite jump.** Predict where a large interval should end instead of reconstructing it from local derivatives.
+
+A fourth family changes the success criterion and matches the output distribution rather than a particular path. This post derives all four from the same local-versus-finite-time gap. We'll carry over the toy from last time — two blobs of data, an exact denoiser derived from Bayes' rule, so any failure is the sampler's fault and not the network's.
+
+> **TL;DR** — A one-step update needs the average velocity over the interval, while an ordinary diffusion or flow model supplies only the instantaneous velocity at the current state. Solvers estimate that average from several evaluations; rectified-flow methods try to make the velocity nearly constant; consistency, flow-map, shortcut, and MeanFlow-style objectives learn finite-time transport directly; distribution-matching methods optimize the output population instead of reproducing a teacher path. At extreme low NFE, formal solver order is not enough: in the toy below, Heun is 2.3× worse than Euler at the same two-call budget.
+
+```{python}
+#| code-fold: true
+#| code-summary: "Setup — the two-blob toy from the previous post (click to expand)"
+import torch, math
+torch.manual_seed(0)
+
+A, S = 2.0, 0.35
+MU = torch.tensor([[-A, 0.0], [A, 0.0]])
+T_START, T_END = 1.0, 1e-3
+
+def denoiser(z, t):
+    """Exact E[x | z_t] for the two-blob data. Derived, not trained."""
+    t = torch.as_tensor(t, dtype=z.dtype)
+    blur = (1 - t)**2 * S**2 + t**2
+    blob_prob = torch.softmax(
+        -0.5 * (z[:, None, :] - (1 - t) * MU).square().sum(-1) / blur, dim=1)
+    precision = 1 / S**2 + (1 - t)**2 / t**2
+    guess_per_blob = (MU / S**2 + (1 - t) * z[:, None, :] / t**2) / precision
+    return (blob_prob[..., None] * guess_per_blob).sum(1)
+
+def velocity(z, t):
+    """Direction of travel at (z, t): away from the noise, toward the signal."""
+    t = torch.as_tensor(t, dtype=z.dtype).clamp(min=1e-3)
+    x_hat = denoiser(z, t)
+    return (z - (1 - t) * x_hat) / t - x_hat
+```
+
+## What a solver is, and what "order" means
+
+The stepping rule from last time is the simplest possible one. It's called **Euler's method**, it dates to 1768, and it says: look at the direction here, and go that way for the whole step.
+
+```{python}
+def euler_step(z, t, t_next):
+    """Take the direction at the start of the interval and commit to it."""
+    return z + (t_next - t) * velocity(z, t)
+```
+
+Its weakness is exactly the one the last post identified: if the direction changes during the step, you've followed a stale direction.
+
+The obvious repair is to check. Take the Euler step *provisionally*, look at the direction where you'd land, and use the average of the two. That's **Heun's method**:
+
+```{python}
+def heun_step(z, t, t_next):
+    """Look ahead with a provisional step, then average the two directions."""
+    h = t_next - t
+    v_here = velocity(z, t)
+    z_provisional = z + h * v_here          # where Euler would have taken us
+    v_there = velocity(z_provisional, t_next)
+    return z + h * 0.5 * (v_here + v_there)  # split the difference
+```
+
+Heun costs **two network calls per step** instead of one. Which brings up the accounting rule that governs this entire subject:
+
+> **Count network evaluations, not only scheduler iterations.** A 10-step Heun run uses 20 fresh field evaluations, while 20 Euler steps use 20. Under the same model and batch shape, equal NFE is the right first comparison of denoiser work. It is still not a complete latency comparison—that is the subject of the next post.
+
+The formal way to describe the difference is **order**. If you halve the step size, a first-order method's error roughly halves; a second-order method's error falls by roughly four. Euler is first-order, Heun is second-order. Let's confirm that on the toy rather than trusting it:
+
+```{python}
+def sample(z, n_steps, step_fn):
+    ts = torch.linspace(T_START, T_END, n_steps + 1)
+    for i in range(n_steps):
+        z = step_fn(z, ts[i], ts[i + 1])
+    return z
+
+start = torch.randn(6000, 2)
+reference = sample(start.clone(), 4000, heun_step)   # so fine it's essentially exact
+
+def error_at(nfe, step_fn, calls_per_step):
+    result = sample(start.clone(), nfe // calls_per_step, step_fn)
+    return (result - reference).norm(dim=-1).mean().item()
+
+print(f"{'NFE':>5} {'Euler':>10} {'Heun':>10}   (equal network calls)")
+for nfe in [2, 4, 8, 16, 32]:
+    print(f"{nfe:>5} {error_at(nfe, euler_step, 1):>10.4f} "
+          f"{error_at(nfe, heun_step, 2):>10.4f}")
+```
+
+```{python}
+#| fig-cap: "Error at equal NFE. Higher order wins once the intervals are moderate, but loses in the extreme two-call regime."
+#| code-fold: true
+import matplotlib.pyplot as plt
+
+budgets = torch.tensor([2, 4, 8, 16, 32])
+euler_errors = [error_at(int(n), euler_step, 1) for n in budgets]
+heun_errors = [error_at(int(n), heun_step, 2) for n in budgets]
+
+plt.figure(figsize=(6.5, 4))
+plt.loglog(budgets, euler_errors, marker="o", label="Euler")
+plt.loglog(budgets, heun_errors, marker="o", label="Heun")
+plt.xlabel("network evaluations (NFE)")
+plt.ylabel("mean endpoint error")
+plt.xticks(budgets.tolist(), [str(int(x)) for x in budgets])
+plt.legend()
+plt.show()
+```
+
+```{python}
+e16, e32 = error_at(16, euler_step, 1), error_at(32, euler_step, 1)
+h16, h32 = error_at(16, heun_step, 2), error_at(32, heun_step, 2)
+print("what happens to the error when you double the budget:")
+print(f"   Euler  ×{e32/e16:.2f}   (first order predicts ×0.50)")
+print(f"   Heun   ×{h32/h16:.2f}   (second order predicts ×0.25)")
+```
+
+The theory holds, and the practical consequence is large: at 32 network calls Heun's error is roughly a tenth of Euler's. A major early branch of diffusion acceleration—DDIM, DEIS, DPM-Solver/DPM-Solver++, UniPC, and related schedulers—reduced sampling cost by changing the deterministic trajectory, its parameterisation, or its numerical integration without retraining the denoiser. These methods are training-free, but not universally interchangeable: prediction type, noise schedule, timestep convention, and preconditioning must match the checkpoint.
+
+## The surprise: better methods can be worse
+
+Now look again at the first row of that table.
+
+At two network calls, **Heun is more than twice as bad as Euler** — 1.60 against 0.69. The second-order method loses badly to the first-order one.
+
+This is not a bug. Order is an *asymptotic* property: it describes what happens once steps are small enough for the local expansion behind the method to be informative. With one enormous Heun step, the provisional Euler point is already badly off the true trajectory. The second evaluation is therefore taken at an off-trajectory state near the singular low-noise endpoint, and averaging it with the first derivative makes the result worse. A correction step helps only when the provisional point is itself meaningful.
+
+> **A method's order tells you its asymptotic rate, not whether it will win at one to four evaluations,** which is precisely where few-step generation lives. Order is also not a cost model: Runge–Kutta methods spend extra evaluations per step, while multistep methods reuse ones they already made.
+
+This is why the sub-10-NFE regime needed genuinely different ideas rather than better quadrature — and why papers reporting one-step results are not simply doing the same thing harder.
+
+## The exact statement of what a one-step method needs
+
+Before the other two families, there's an identity that makes both of them obvious. It's worth the two minutes.
+
+One Euler step from $t=1$ to $t=0$ produces $z_1 + \Delta t \cdot v(z_1, 1)$, where $v(z_1,1)$ is the direction *at the start*. The true endpoint is $z_1 + \Delta t \cdot \bar v$, where $\bar v$ is the **average** direction over the whole journey — total displacement divided by elapsed time. Subtract them:
+
+$$\text{one-step error} = |\Delta t| \cdot \lVert\, \underbrace{v(z_1, 1)}_{\text{what the model gives you}} - \underbrace{\bar v}_{\text{what you needed}} \,\rVert$$
+
+Not a bound. An identity:
+
+```{python}
+probe = torch.randn(3000, 2)
+true_end = sample(probe.clone(), 800, heun_step)
+
+average_direction = (true_end - probe) / (T_END - T_START)     # displacement / time
+initial_direction = velocity(probe, torch.tensor(T_START))
+
+actual_error = (probe + (T_END - T_START) * initial_direction - true_end).norm(dim=-1)
+predicted    = ((T_END - T_START) * (initial_direction - average_direction)).norm(dim=-1)
+
+print(f"largest disagreement between the two, over 3000 samples: "
+      f"{(actual_error - predicted).abs().max():.1e}")
+```
+
+Zero to floating-point precision. Which reorganises the whole problem:
+
+> **Over each sampling interval, the update needs the average velocity across that interval; an ordinary model gives the instantaneous velocity at queried states.** Every method below bridges that gap differently.
+
+- **Better solvers** estimate the average by sampling the direction at several points and combining them. Heun's two evaluations are literally a two-point estimate of a mean. This also explains their floor: with one generic evaluation you cannot in general recover an interval average without extra assumptions about the field.
+- **Straightening** attacks the other side. If the direction never changes along the path, then $v(z_1,1) = \bar v$ exactly, the gap is zero, and one step is not approximately right but *exactly* right.
+- **Learning a jump** sidesteps the estimation by regressing the endpoint, or the average direction, directly.
+
+## Family 2: make the velocity easier to integrate
+
+If rapid velocity variation is what costs you, train a process whose trajectories are closer to constant-velocity motion.
+
+**Rectified flow** chooses linear conditional paths: $z_t = (1-t)x + t\epsilon$ connects one data sample and one noise sample with constant conditional velocity $\epsilon-x$. Why, then, can the learned marginal trajectories still bend or change speed?
+
+Because of which pairs get matched. During training, each image is paired with *random* noise. Many different training lines pass through the same region of space, heading to different destinations, and the network — which can only output one direction per location — must return their average. That averaging is what bends the path. It is the same averaging that made the denoiser return the dataset mean at $t=1$, seen from the other side.
+
+**Reflow** fixes the pairing. Run the trained model to generate matched $(\text{noise}, \text{image})$ pairs, then retrain on *those* pairs instead of random ones. Now the pairing is deterministic, far fewer lines cross, and the learned field straightens. Repeat for more straightening.
+
+The payoff, on a path that's genuinely straight:
+
+```{python}
+# Construct a deterministically-paired straight path: each start point is assigned
+# a fixed destination, so the direction is constant along the whole trajectory.
+noise = torch.randn(4000, 2)
+destination = torch.stack([torch.sign(noise[:, 0]) * A,
+                           torch.zeros(4000)], dim=-1)
+constant_direction = noise - destination        # same at every point on the path
+
+one_giant_step = noise - 1.0 * constant_direction
+print(f"one Euler step on a straight path — largest error: "
+      f"{(one_giant_step - destination).abs().max():.1e}")
+```
+
+Exactly zero. Not small—zero. When the trajectory is affine in time, so the velocity is constant over the interval, one Euler step is the whole journey.
+
+Worth being precise about what this does and doesn't show. It's the numerical statement only: *if* the correct trajectory has constant velocity in the chosen time parameterisation, one step is exact. Learning a model whose paths are that straight is the hard part, and reflow buys it at real cost — you must generate a large synthetic dataset with the teacher, and each round inherits whatever the teacher got wrong.
+
+## Family 3: learn finite-time transport
+
+The direct response is to stop asking a local model to answer a long-range question indirectly. Train a model whose output already describes a **finite interval**.
+
+There are three increasingly general versions of that idea.
+
+### Endpoint maps: consistency models
+
+A consistency model learns a function $f(z_t,t)$ whose answer should be the same for every point on the same probability-flow trajectory: the clean endpoint. The training signal says, in effect,
+
+> these two noisy states lie on one path, so they should decode to the same sample.
+
+At inference, one call can map noise directly to data. Multi-step consistency sampling can deliberately add noise and apply the map again, trading more compute for correction and diversity.
+
+### Two-time maps: trajectories, shortcuts, and flow maps
+
+An endpoint map answers only “where does this trajectory finish?” A more general model receives a start time and a destination time:
+
+$$f(z_t,t,s)\approx z_s.$$
+
+Now the same network can make a long jump or several short ones.
+
+- **Consistency trajectory models** learn transitions to arbitrary later points rather than only the endpoint.
+- **Shortcut models** condition explicitly on the requested step size, so one set of weights learns both local and long updates.
+- **Flow-map models** treat this two-time transition as the central object and can compose several maps when a larger compute budget is available.
+
+The conceptual advantage is adjustable compute: the model is trained for the kind of finite jump it will actually make, rather than hoping a local derivative remains valid.
+
+### Average velocity: MeanFlow
+
+A finite jump can also be represented by the constant velocity that would produce the same displacement:
+
+$$\bar v_{t\rightarrow s}
+=
+\frac{z_s-z_t}{s-t}.$$
+
+Flow matching models the instantaneous velocity $v(z_t,t)$. **MeanFlow** models this interval-average velocity directly and derives a training identity relating the two. If the average velocity were predicted exactly, the finite update would have no integration error; learned approximation error would remain.
+
+MeanFlow was trained from scratch—without a pretrained teacher, progressive distillation, or a curriculum—and reported 3.43 FID at one NFE on ImageNet $256^2$. Later work broadened this direct-training frontier: Improved MeanFlow reported stronger one-step results, Pixel MeanFlow moved the objective to latent-free pixel generation, and W-Flow proposed a different direct one-step objective. These paper-reported numbers are not clean rankings because architectures, compute, data processing, and evaluation protocols differ.
+
+### What changed in 2025–26
+
+The field did not simply “move from distillation to direct training.” It split into complementary routes:
+
+- **Direct objectives** such as MeanFlow train the foundation model itself for one-step generation.
+- **Flow-map and consistency objectives** now support adjustable one-to-few-step budgets and have scaled beyond small academic models.
+- **Distillation** remains the natural route when the expensive pretrained model is the asset you need to preserve.
+
+A useful recent example is score-regularized continuous-time consistency, which scaled one-to-four-step distillation to image and video models up to 14B parameters. The practical frontier is therefore not one winning family but better ways to preserve detail and diversity at very low NFE.
+
+## Family 4: match the destination distribution
+
+This family does not require the student to reproduce a particular teacher trajectory. It asks whether the **population of generated outputs** has the right distribution.
+
+**Distribution matching distillation** (DMD, DMD2) trains a few-step generator so that its output distribution approaches the target distribution represented by real data and/or a pretrained diffusion teacher. It never requires the student to land where the teacher would have for a given seed — only that the population of outputs be right. **Adversarial distillation** (ADD, LADD) adds a discriminator to the same goal, and produced the SDXL-Turbo line.
+
+The distinction that predicts their failure modes:
+
+- **Pointwise teacher-following** strongly anchors the student to the teacher's noise-to-image mapping. This preserves behaviour but also transfers systematic weaknesses unless other objectives counteract them.
+- **Distribution-level objectives** constrain the output population rather than every seed-wise pairing. They may improve some teacher weaknesses, but the weaker anchoring also makes diversity drift and prompt-specific regressions easier to hide.
+
+## What to carry away
+
+- **Count NFE, not only steps.** Heun at 10 steps costs 20 fresh calls. Equal NFE is the fair first comparison of denoiser work; wall-clock latency still requires measurement.
+- **Compatible solvers are the first training-free move.** On many models they reach useful quality around 10–25 NFE, but the floor is checkpoint-, guidance-, and scheduler-dependent. In the toy, the measured error ratios are ×0.51 for Euler and ×0.34 for Heun per budget doubling.
+- **Order is asymptotic, and can invert at low budgets.** Heun is 2.3× *worse* than Euler at two network calls, because its look-ahead lands somewhere meaningless. Formal order is also not a cost model.
+- **The exact requirement:** one-step error is the gap between the instantaneous direction the model gives you and the average direction you need. Solvers estimate the average; straightening makes them equal; MeanFlow models the average directly.
+- **On a constant-velocity trajectory one step is exact**—zero integration error, not merely small error. Rectified-flow and reflow methods try to move real trajectories closer to that regime.
+- **Pointwise and distribution-level training make different commitments.** The former preserves a teacher mapping more closely; the latter allows more freedom and therefore different failure modes.
+
+If one sentence survives: *local models predict what to do now; fast generators either estimate, simplify, or directly learn what should happen over a finite interval.*
+
+## Where this goes next
+
+We now have methods that produce good images in one to four network calls instead of fifty. That looks like a 20× speedup, and in production it very often isn't — because network calls are not the only thing you pay for, and some acceleration techniques cancel each other out. [The next post](06-what-acceleration-costs.qmd) is about the difference between the number in the paper and the number in your latency budget.
+
+## References
+
+**Solvers**
+
+- Song, Meng & Ermon, [*Denoising Diffusion Implicit Models*](https://arxiv.org/abs/2010.02502), 2020.
+- Zhang & Chen, [*Fast Sampling of Diffusion Models with Exponential Integrator*](https://arxiv.org/abs/2204.13902) (DEIS), 2022.
+- Lu et al., [*DPM-Solver*](https://arxiv.org/abs/2206.00927), 2022 and [*DPM-Solver++*](https://arxiv.org/abs/2211.01095), 2022.
+- Sabour et al., [*Align Your Steps*](https://arxiv.org/abs/2404.14507), 2024 — optimising *where* the steps go, per model and solver.
+
+**Straightening**
+
+- Liu, Gong & Liu, [*Flow Straight and Fast: Rectified Flow*](https://arxiv.org/abs/2209.03003), 2022.
+- Liu et al., [*InstaFlow*](https://arxiv.org/abs/2309.06380), 2023.
+
+**Learning the jump**
+
+- Song et al., [*Consistency Models*](https://arxiv.org/abs/2303.01469), 2023.
+- Kim et al., [*Consistency Trajectory Models*](https://arxiv.org/abs/2310.02279), 2023.
+- Lu & Song, [*Simplifying, Stabilizing and Scaling Continuous-Time Consistency Models*](https://arxiv.org/abs/2410.11081), ICLR 2025.
+- Frans et al., [*One Step Diffusion via Shortcut Models*](https://arxiv.org/abs/2410.12557), ICLR 2025.
+- Geng et al., [*Mean Flows for One-Step Generative Modeling*](https://arxiv.org/abs/2505.13447), NeurIPS 2025 (oral).
+- Geng et al., [*Improved Mean Flows*](https://arxiv.org/abs/2512.02012), 2025.
+- Boffi et al., [*Flow Map Matching*](https://arxiv.org/abs/2406.07507), 2024; Sabour et al., [*Align Your Flow*](https://arxiv.org/abs/2506.14603), 2025.
+- Lu et al., [*One-step Latent-free Image Generation with Pixel Mean Flows*](https://arxiv.org/abs/2601.22158), 2026.
+- Han et al., [*One-Step Generative Modeling via Wasserstein Gradient Flows*](https://arxiv.org/abs/2605.11755), 2026 preprint.
+- Zheng et al., [*Large Scale Diffusion Distillation via Score-Regularized Continuous-Time Consistency*](https://openreview.net/forum?id=2uNlM353RI), ICLR 2026.
+
+**Matching the distribution**
+
+- Salimans & Ho, [*Progressive Distillation*](https://arxiv.org/abs/2202.00512), 2022.
+- Yin et al., [*One-step Diffusion with Distribution Matching Distillation*](https://arxiv.org/abs/2311.18828), 2023.
+- Sauer et al., [*Adversarial Diffusion Distillation*](https://arxiv.org/abs/2311.17042), 2023.
+- Luo et al., [*Latent Consistency Models*](https://arxiv.org/abs/2310.04378) and LCM-LoRA, 2023.

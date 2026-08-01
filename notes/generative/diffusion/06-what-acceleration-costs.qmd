@@ -1,0 +1,224 @@
+---
+title: "What Acceleration Actually Costs"
+description: "A paper reports 50 steps to 4 and calls it a 12× speedup. Your service will not see 12×. This post is about the gap: the things you pay for besides network calls, the accelerations that cancel each other out, and the failure modes that only appear once the step count is low."
+categories: [generative, diffusion]
+date: 2026-08-03
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+[The previous post](05-fewer-steps.qmd) showed how sampling can fall from dozens of denoiser evaluations to one to four. That may be a 12–50× reduction in NFE, but it is not automatically a 12–50× reduction in the latency a user sees.
+
+The gap is not anyone being dishonest. It's that **NFE — the number of network evaluations — is a proxy for cost, and like all proxies it stops tracking the thing it stands for once you optimise it hard enough.** This post is about what else you're paying for, which accelerations cancel each other out, and the failure modes that only show up after the step count comes down.
+
+> **TL;DR** — NFE measures one part of a generation pipeline: denoiser work. As NFE falls, one-time costs such as text encoding, latent decoding, dispatch, and synchronization become visible; ordinary CFG roughly doubles denoiser-equivalent work; cross-step caching loses the redundancy it depends on; and approximation errors change character because there are fewer correction stages. In serving, predictable fixed-step execution can also beat a lower-average adaptive policy because batches stay aligned.
+
+## Where the time actually goes
+
+Sampling is not the only thing a diffusion pipeline does. A text-to-image request may encode the prompt, prepare conditioning, and decode a latent into pixels. These are **per-request or per-batch costs**: they do not scale linearly with the number of denoising steps, although they still depend on batch size, resolution, model choice, and hardware.
+
+That barely matters at 50 steps, when denoising dominates everything. It matters enormously at 4. The arithmetic is Amdahl's law, and it's worth doing explicitly because the intuition is unreliable:
+
+```{python}
+# Illustrative numbers for a text-to-image pipeline. The exact values depend
+# entirely on the model and hardware — what matters here is the SHAPE.
+text_encode  = 8.0     # ms, once per request
+per_step     = 26.0    # ms, per denoising step
+vae_decode   = 55.0    # ms, once per request
+overhead     = 4.0     # ms, scheduler + memory + dispatch, once
+
+def total_latency(steps):
+    return text_encode + steps * per_step + vae_decode + overhead
+
+for steps in [50, 20, 8, 4, 2, 1]:
+    total = total_latency(steps)
+    denoise_share = steps * per_step / total
+    print(f"{steps:>3} steps: {total:>7.1f} ms   "
+          f"denoising is {denoise_share:>5.1%} of it   "
+          f"speedup vs 50 steps: {total_latency(50)/total:>5.2f}×")
+```
+
+**In this illustrative profile**, going from 50 steps to 1 is a 50× reduction in NFE but only a 14.7× reduction in latency. The last stretch is especially inelastic: 4 steps to 1 cuts NFE by 4× and latency by only about 1.8×. At one step, denoising is 28% of this particular request.
+
+Two practical consequences follow immediately:
+
+- **Fixed costs can dominate surprisingly early.** In the toy budget above, the decoder becomes larger than one denoising evaluation and dominates the one-step request. A larger DiT or a cheaper decoder can produce a very different crossover, so profile rather than memorise “eight steps.”
+- **A one-step model is not automatically four times faster than a four-step model.** The achievable ratio depends on the denoiser share, backbone size, CFG, decoder cost, batching, and kernel efficiency.
+
+```{python}
+#| fig-cap: "Illustrative latency decomposition. As denoising shrinks, one-time pipeline costs become the limiting fraction."
+#| code-fold: true
+import matplotlib.pyplot as plt
+
+step_counts = [50, 20, 8, 4, 2, 1]
+denoise = [s * per_step for s in step_counts]
+fixed = [text_encode + vae_decode + overhead for _ in step_counts]
+
+plt.figure(figsize=(7, 4))
+plt.bar([str(s) for s in step_counts], denoise, label="denoising")
+plt.bar([str(s) for s in step_counts], fixed, bottom=denoise, label="other pipeline cost")
+plt.xlabel("scheduler iterations")
+plt.ylabel("illustrative latency (ms)")
+plt.legend()
+plt.show()
+```
+
+## How to profile the real pipeline
+
+The illustrative arithmetic is useful only if it leads to measurement. GPU timing has three common traps:
+
+1. CUDA work is asynchronous, so ordinary wall-clock timing can stop before the kernels finish.
+2. The first iterations include compilation, memory allocation, and cache warm-up.
+3. End-to-end latency and isolated kernel time answer different questions.
+
+A minimal harness should warm up, synchronize, repeat, and report the environment:
+
+```{python}
+#| eval: false
+#| code-fold: true
+#| code-summary: "CUDA timing skeleton"
+import statistics
+import time
+import torch
+
+def benchmark_cuda(fn, warmup=10, repeats=50):
+    # Return synchronized per-call latency in milliseconds.
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    samples = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter() - start) * 1e3)
+
+    return {
+        "median_ms": statistics.median(samples),
+        "p95_ms": sorted(samples)[int(0.95 * (len(samples) - 1))],
+    }
+```
+
+Measure at least two views:
+
+- **component time**: text encoder, each denoiser call, VAE, and post-processing separately;
+- **end-to-end time**: the real request path, including transfers, synchronization, and batching.
+
+Also record batch size, resolution, dtype, guidance mode, compilation state, hardware, and whether the reported number is cold, warm, p50, p95, latency, or saturated throughput. Without that context, a speedup is difficult to reproduce.
+
+## Guidance: the factor of two that goes uncounted
+
+[Classifier-free guidance](02-classifier-free-guidance.qmd) is a common way to strengthen prompt conditioning. At each step it needs a conditional and an unconditional prediction. Implementations often concatenate both branches into one larger batch, so it may be one framework invocation, but it still performs roughly twice the denoiser arithmetic and uses more memory.
+
+Twice. Every step.
+
+```{python}
+steps = 4
+print(f"a '{steps}-step' sampler with classifier-free guidance:")
+print(f"   {steps} scheduler iterations")
+print(f"   {steps * 2} actual network evaluations")
+print(f"\nversus an unguided {steps * 2}-step sampler: identical network cost, "
+      f"and one of them is described with a number twice as large.")
+```
+
+For the same backbone, shape, and hardware, a four-step run with ordinary CFG performs roughly the denoiser work of eight unguided evaluations. Batching efficiency can change wall clock, so call this **sample-equivalent denoiser work**, not identical end-to-end cost. When step counts are compared, check whether guidance is inside or outside the accounting.
+
+This also explains a behaviour that confuses people about distilled few-step models: **some of them expect zero external CFG or a checkpoint-specific guidance range.** Running ordinary CFG at one step would double the only denoiser work, so guidance is often *distilled in* — the student learns the already-guided output, sometimes with the guidance strength baked to a fixed value, sometimes as an extra input. Either way, the knob you're turning is not the teacher's knob, and it may have a much narrower useful range or none at all.
+
+## Caching: the speedup that vanishes exactly when you need it
+
+Here's an interaction that catches teams out.
+
+Adjacent denoising steps produce very similar internal activations — the input barely changed, so much of the network's intermediate work barely changed either. **Cross-step feature caching** exploits this: compute a block's output at one step, reuse it for the next, skip the work. Methods like TeaCache and its relatives get substantial speedups this way, and it requires no retraining.
+
+Now count what happens when you combine it with a few-step model:
+
+```{python}
+for steps in [50, 20, 8, 4, 2, 1]:
+    reuse_opportunities = max(steps - 1, 0)      # you can only reuse from a PREVIOUS step
+    print(f"{steps:>3} steps → {reuse_opportunities:>2} chances to reuse a cached feature"
+          f"{'   ← nothing to cache' if reuse_opportunities == 0 else ''}")
+```
+
+**Cross-step caching and step reduction are not independent speedups—they compete for the same temporal redundancy.** A 50-step sampler has enormous cross-step redundancy, which is why caching works so well there. A 1-step model has none, by construction. You cannot multiply the two speedups together, and a plan that assumes you can will overshoot badly.
+
+The general lesson, which applies well beyond caching: **acceleration techniques are not independent multipliers.** Always measure the combination, never compose the individual claims.
+
+## Failure modes that only appear at low step counts
+
+Six things that were fine at 50 steps and are not fine at 4.
+
+**1 · Your scheduler and your checkpoint disagree.** Few-step models are trained for a specific sampling procedure. Loading a distilled checkpoint and running it with the default scheduler — or with a guidance scale it was never trained under — produces output that is bad in a way that looks like a bad model. Check what the checkpoint expects.
+
+**2 · A second-order label hides the real cost.** A Runge–Kutta method such as Heun spends two fresh evaluations per step; a second-order multistep method may reuse a previous prediction and spend only one new call after startup. As [the previous post](05-fewer-steps.qmd) measured, formal order can also reverse at extreme low NFE. Count new denoiser evaluations and validate the actual low-budget regime.
+
+**3 · Guidance applied twice.** If guidance was distilled into the model and you also apply it at sampling time, you're extrapolating an already-extrapolated prediction. The symptom is oversaturation and posterised flat regions — the same signature as an over-cranked guidance scale, but arriving at a setting that looks reasonable.
+
+**4 · Prompt-conditioned diversity collapses while aggregate FID can look acceptable.** Few-step models, especially adversarially trained ones, tend to lose sample variety. A distribution-level metric computed over thousands of prompts can look healthy while every image *for a given prompt* has become nearly identical. The check takes two minutes and almost nobody runs it: fix one prompt, vary the seed, look at the spread. Report that alongside FID.
+
+**5 · Pointwise distillation transfers the teacher's behaviour.** A student trained to reproduce the teacher's seed-wise mapping will usually inherit systematic weaknesses—including schedule or [terminal-SNR mismatch](03-noise-schedule.qmd)—unless auxiliary data or objectives counteract them. Distribution-level methods are less tightly anchored, which creates both room for improvement and room for drift.
+
+**6 · Approximation sensitivity changes when NFE changes.** Quantization or cache error can accumulate across a long trajectory, but a multi-step sampler may also correct some imperfect intermediate states. A strict one-step generator has no later denoising stage in which to recover. There is no universal monotonic rule: **revalidate precision, caching thresholds, and numerical approximations after changing NFE** rather than inheriting the teacher's settings.
+
+## Why adaptive step counts can lose in production
+
+Adaptive solvers vary the number of steps per sample: easy samples finish early, hard ones get more. Offline that's a clear win on average NFE.
+
+In a serving system it frequently isn't, and the two ways of implementing it fail differently:
+
+- **Per-sample adaptivity** fragments the batch. Different samples run different numbers of iterations, which means divergent execution and idle GPU while the stragglers finish.
+- **A shared adaptive controller** keeps the batch together but lets the hardest sample in it set the schedule for everyone.
+
+Either can lose to a fixed four-step policy that batches predictably, even when the adaptive method uses fewer evaluations on average. This is a serving trade-off, not a universal result; the crossover depends on batch formation, workload variance, and whether the system can refill partially completed batches. The second failure is exactly the convoy effect from [the continuous batching post](../../llm-systems/inference/continuous-batching/03-continuous-batching.qmd), arriving in a different costume: a batch moves at the speed of its slowest member unless you design against it.
+
+## What's actually worth doing
+
+One reasonable decision order is below. The effort and useful NFE ranges are illustrative—they vary sharply with model size, data access, and infrastructure:
+
+| Approach | Cost to you | Typical NFE | Works on an existing model? |
+|---|---|---|---|
+| Compatible solver (DPM-Solver++, UniPC) | minimal | often 10–25 | yes, when schedule and prediction type match |
+| Tuned step placement (e.g. Align Your Steps) | search/evaluation | often 10–20 | yes, for the model–solver pair |
+| Optimise the decoder and fixed costs | hours | — | yes, and increasingly dominant |
+| Feature caching | hours | 10–50 | yes, but conflicts with step reduction |
+| Quantization | days | — | yes, revalidate at low NFE |
+| LCM-LoRA style adapters | hours | 4–8 | yes, as an adapter |
+| Distillation (DMD2, ADD, SiD) | substantial training | 1–4 | produces a new model |
+| From-scratch one-step objective (MeanFlow family) | foundation-model training | 1 | no—it is the model |
+
+**If you have a pretrained model and want it faster this week**, the honest ordering is: exhaust the free options first (better solver, tuned step schedule), then measure where the time actually goes, and only then consider distillation. Teams routinely skip to distillation and discover afterwards that their VAE decoder was 40% of the latency.
+
+One frontier note, briefly: recent work has started widening what "the budget" even means — **1.x-Distill** explores fractional effective NFE with cache-aware distillation, and **MrFlow** stages low- and high-resolution sampling to cut spatial compute, composing with timestep distillation rather than replacing it. Both are recent preprints. They reinforce this post's point: acceleration is not a single "number of steps" knob.
+
+## What to carry away
+
+- **NFE is a proxy for cost, and it stops tracking cost once you optimise it hard.** In the illustrative pipeline above, a 50× NFE reduction bought under 15× latency, and the final 4×-of-NFE bought about 1.8×.
+- **Fixed costs can take over at low NFE.** Their crossover is model- and hardware-specific; the only reliable answer comes from a component profile.
+- **Ordinary CFG requires two predictions per step.** They may be batched into one invocation, but the denoiser-equivalent work and memory pressure remain close to two branches.
+- **Caching and step reduction eat the same redundancy.** They do not multiply, and at one step there is nothing left to cache.
+- **Revalidate approximations after changing NFE.** Error may accumulate differently, and one-step models have no later correction stage.
+- **Check per-prompt diversity, not just FID.** Aggregate metrics hide the collapse that few-step models are most prone to.
+- **Fixed schedules can beat adaptive ones in production** when predictable batching matters more than a lower average NFE.
+
+If one sentence survives: *the number in the paper counts network evaluations, and the number in your latency budget counts everything else too.*
+
+## Where this goes next
+
+Three things this series deliberately left alone. **Video**, where the step count multiplies by frame count and few-step generation is the difference between a demo and a product. **The systems layer** — quantization, kernel work, and distributed inference — which is orthogonal to everything here and often the cheapest win available. And **flow matching itself**, which has been used throughout as the convenient formalism without being derived properly; that derivation is its own post and the natural companion to this one.
+
+## References
+
+- Ma et al., [*DeepCache*](https://arxiv.org/abs/2312.00858), 2023 — cross-step feature reuse, and the redundancy that few-step sampling removes.
+- Liu et al., [*TeaCache*](https://arxiv.org/abs/2411.19108), 2024 — timestep-aware caching.
+- Li et al., [*SnapFusion*](https://arxiv.org/abs/2306.00980), 2023 — an early and clear account of where the time actually goes in a diffusion pipeline.
+- Chen et al., [*SANA-Sprint*](https://arxiv.org/abs/2503.09641), 2025 — few-step generation with the full pipeline cost taken seriously.
+- Sauer et al., [*Adversarial Diffusion Distillation*](https://arxiv.org/abs/2311.17042), 2023 — the SDXL-Turbo line, and where distilled guidance comes from.
+
+- Li et al., [*1.x-Distill*](https://arxiv.org/abs/2604.04018), 2026 — fractional effective NFE and cache-aware distillation.
+- Zheng et al., [*Multi-Resolution Flow Matching (MrFlow)*](https://arxiv.org/abs/2607.01642), 2026 — staged low-to-high-resolution sampling that composes with timestep distillation.
