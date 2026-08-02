@@ -177,7 +177,7 @@ In a serving system it frequently isn't, and the two ways of implementing it fai
 - **Per-sample adaptivity** fragments the batch. Different samples run different numbers of iterations, which means divergent execution and idle GPU while the stragglers finish.
 - **A shared adaptive controller** keeps the batch together but lets the hardest sample in it set the schedule for everyone.
 
-Either can lose to a fixed four-step policy that batches predictably, even when the adaptive method uses fewer evaluations on average. This is a serving trade-off, not a universal result; the crossover depends on batch formation, workload variance, and whether the system can refill partially completed batches. The second failure is exactly the convoy effect from [the continuous batching post](../llm-systems/03-continuous-batching.qmd), arriving in a different costume: a batch moves at the speed of its slowest member unless you design against it.
+Either can lose to a fixed four-step policy that batches predictably, even when the adaptive method uses fewer evaluations on average. This is a serving trade-off, not a universal result; the crossover depends on batch formation, workload variance, and whether the system can refill partially completed batches. The second failure is exactly the convoy effect from [the continuous batching post](../../llm-systems/inference/continuous-batching/03-continuous-batching.qmd), arriving in a different costume: a batch moves at the speed of its slowest member unless you design against it.
 
 ## What's actually worth doing
 
