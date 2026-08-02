@@ -1,8 +1,8 @@
 ---
 title: "Fewer Steps: Follow the Curve, Straighten It, or Skip It"
-description: "Three families of fast-sampling methods, derived rather than listed. Including the result that surprises people: a mathematically better solver can be twice as bad as a crude one when you only have two network calls to spend."
+description: "Four responses to the same fast-sampling problem, derived rather than listed. Including the result that surprises people: a mathematically better solver can be twice as bad as a crude one when you only have two network calls to spend."
 categories: [generative, diffusion]
-date: 2026-08-02
+date: 2026-08-01
 depth: "Deep dive"
 format:
   html:
@@ -22,7 +22,7 @@ There are three geometric responses:
 
 A fourth family changes the success criterion and matches the output distribution rather than a particular path. This post derives all four from the same local-versus-finite-time gap. We'll carry over the toy from last time — two blobs of data, an exact denoiser derived from Bayes' rule, so any failure is the sampler's fault and not the network's.
 
-> **TL;DR** — A one-step update needs the average velocity over the interval, while an ordinary diffusion or flow model supplies only the instantaneous velocity at the current state. Solvers estimate that average from several evaluations; rectified-flow methods try to make the velocity nearly constant; consistency, flow-map, shortcut, and MeanFlow-style objectives learn finite-time transport directly; distribution-matching methods optimize the output population instead of reproducing a teacher path. At extreme low NFE, formal solver order is not enough: in the toy below, Heun is 2.3× worse than Euler at the same two-call budget.
+> **TL;DR** — (*NFE* = number of function evaluations: how many times the denoiser is called.) A one-step update needs the average velocity over the interval, while an ordinary diffusion or flow model supplies only the instantaneous velocity at the current state. Solvers estimate that average from several evaluations; rectified-flow methods try to make the velocity nearly constant; consistency, flow-map, shortcut, and MeanFlow-style objectives learn finite-time transport directly; distribution-matching methods optimize the output population instead of reproducing a teacher path. At extreme low NFE, formal solver order is not enough: in the toy below, Heun is 2.3× worse than Euler at the same two-call budget.
 
 ```{python}
 #| code-fold: true
@@ -140,7 +140,7 @@ This is not a bug. Order is an *asymptotic* property: it describes what happens 
 
 > **A method's order tells you its asymptotic rate, not whether it will win at one to four evaluations,** which is precisely where few-step generation lives. Order is also not a cost model: Runge–Kutta methods spend extra evaluations per step, while multistep methods reuse ones they already made.
 
-This is why the sub-10-NFE regime needed genuinely different ideas rather than better quadrature — and why papers reporting one-step results are not simply doing the same thing harder.
+This helps explain why solver improvements alone tend to hit a model-dependent floor in the one-to-four-evaluation regime — and why papers reporting one-step results are not simply doing the same thing harder.
 
 ## The exact statement of what a one-step method needs
 
@@ -154,12 +154,13 @@ Not a bound. An identity:
 
 ```{python}
 probe = torch.randn(3000, 2)
-true_end = sample(probe.clone(), 800, heun_step)
+reference_end = sample(probe.clone(), 800, heun_step)   # fine-grained numerical reference,
+                                                        # not an analytic endpoint
 
-average_direction = (true_end - probe) / (T_END - T_START)     # displacement / time
+average_direction = (reference_end - probe) / (T_END - T_START)     # displacement / time
 initial_direction = velocity(probe, torch.tensor(T_START))
 
-actual_error = (probe + (T_END - T_START) * initial_direction - true_end).norm(dim=-1)
+actual_error = (probe + (T_END - T_START) * initial_direction - reference_end).norm(dim=-1)
 predicted    = ((T_END - T_START) * (initial_direction - average_direction)).norm(dim=-1)
 
 print(f"largest disagreement between the two, over 3000 samples: "
@@ -207,7 +208,7 @@ Worth being precise about what this does and doesn't show. It's the numerical st
 
 The direct response is to stop asking a local model to answer a long-range question indirectly. Train a model whose output already describes a **finite interval**.
 
-There are three increasingly general versions of that idea.
+There are three useful ways to represent a finite interval.
 
 ### Endpoint maps: consistency models
 
@@ -298,6 +299,7 @@ We now have methods that produce good images in one to four network calls instea
 - Song et al., [*Consistency Models*](https://arxiv.org/abs/2303.01469), 2023.
 - Kim et al., [*Consistency Trajectory Models*](https://arxiv.org/abs/2310.02279), 2023.
 - Lu & Song, [*Simplifying, Stabilizing and Scaling Continuous-Time Consistency Models*](https://arxiv.org/abs/2410.11081), ICLR 2025.
+- Luo et al., [*Latent Consistency Models*](https://arxiv.org/abs/2310.04378) and LCM-LoRA, 2023.
 - Frans et al., [*One Step Diffusion via Shortcut Models*](https://arxiv.org/abs/2410.12557), ICLR 2025.
 - Geng et al., [*Mean Flows for One-Step Generative Modeling*](https://arxiv.org/abs/2505.13447), NeurIPS 2025 (oral).
 - Geng et al., [*Improved Mean Flows*](https://arxiv.org/abs/2512.02012), 2025.
@@ -311,4 +313,3 @@ We now have methods that produce good images in one to four network calls instea
 - Salimans & Ho, [*Progressive Distillation*](https://arxiv.org/abs/2202.00512), 2022.
 - Yin et al., [*One-step Diffusion with Distribution Matching Distillation*](https://arxiv.org/abs/2311.18828), 2023.
 - Sauer et al., [*Adversarial Diffusion Distillation*](https://arxiv.org/abs/2311.17042), 2023.
-- Luo et al., [*Latent Consistency Models*](https://arxiv.org/abs/2310.04378) and LCM-LoRA, 2023.

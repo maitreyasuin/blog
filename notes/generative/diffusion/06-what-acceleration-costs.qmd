@@ -1,8 +1,8 @@
 ---
 title: "What Acceleration Actually Costs"
-description: "A paper reports 50 steps to 4 and calls it a 12× speedup. Your service will not see 12×. This post is about the gap: the things you pay for besides network calls, the accelerations that cancel each other out, and the failure modes that only appear once the step count is low."
+description: "A paper reports 50 steps to 4 and calls it a 12× speedup. Your service may not see 12×. This post is about the gap: the things you pay for besides network calls, the accelerations that cancel each other out, and the failure modes that only appear once the step count is low."
 categories: [generative, diffusion]
-date: 2026-08-03
+date: 2026-08-01
 depth: "Deep dive"
 format:
   html:
@@ -22,7 +22,7 @@ The gap is not anyone being dishonest. It's that **NFE — the number of network
 
 Sampling is not the only thing a diffusion pipeline does. A text-to-image request may encode the prompt, prepare conditioning, and decode a latent into pixels. These are **per-request or per-batch costs**: they do not scale linearly with the number of denoising steps, although they still depend on batch size, resolution, model choice, and hardware.
 
-That barely matters at 50 steps, when denoising dominates everything. It matters enormously at 4. The arithmetic is Amdahl's law, and it's worth doing explicitly because the intuition is unreliable:
+In many conventional 50-step pipelines denoising dominates enough that these fixed costs receive little attention. It matters enormously at 4. The arithmetic is Amdahl's law, and it's worth doing explicitly because the intuition is unreliable:
 
 ```{python}
 # Illustrative numbers for a text-to-image pipeline. The exact values depend
@@ -122,9 +122,11 @@ Twice. Every step.
 steps = 4
 print(f"a '{steps}-step' sampler with classifier-free guidance:")
 print(f"   {steps} scheduler iterations")
-print(f"   {steps * 2} actual network evaluations")
-print(f"\nversus an unguided {steps * 2}-step sampler: identical network cost, "
-      f"and one of them is described with a number twice as large.")
+print(f"   {steps} denoiser invocations, each with the batch doubled")
+print(f"   ≈ {steps * 2} single-branch evaluation equivalents of arithmetic")
+print()
+print("An unguided 8-step sampler has a similar single-branch FLOP count —")
+print("but not necessarily the same memory use or latency.")
 ```
 
 For the same backbone, shape, and hardware, a four-step run with ordinary CFG performs roughly the denoiser work of eight unguided evaluations. Batching efficiency can change wall clock, so call this **sample-equivalent denoiser work**, not identical end-to-end cost. When step counts are compared, check whether guidance is inside or outside the accounting.
@@ -150,17 +152,17 @@ for steps in [50, 20, 8, 4, 2, 1]:
 
 The general lesson, which applies well beyond caching: **acceleration techniques are not independent multipliers.** Always measure the combination, never compose the individual claims.
 
-## Failure modes that only appear at low step counts
+## Failure modes that become more consequential at low step counts
 
-Six things that were fine at 50 steps and are not fine at 4.
+Six issues that are easier to tolerate, overlook, or repair at 50 steps than at 4.
 
 **1 · Your scheduler and your checkpoint disagree.** Few-step models are trained for a specific sampling procedure. Loading a distilled checkpoint and running it with the default scheduler — or with a guidance scale it was never trained under — produces output that is bad in a way that looks like a bad model. Check what the checkpoint expects.
 
 **2 · A second-order label hides the real cost.** A Runge–Kutta method such as Heun spends two fresh evaluations per step; a second-order multistep method may reuse a previous prediction and spend only one new call after startup. As [the previous post](05-fewer-steps.qmd) measured, formal order can also reverse at extreme low NFE. Count new denoiser evaluations and validate the actual low-budget regime.
 
-**3 · Guidance applied twice.** If guidance was distilled into the model and you also apply it at sampling time, you're extrapolating an already-extrapolated prediction. The symptom is oversaturation and posterised flat regions — the same signature as an over-cranked guidance scale, but arriving at a setting that looks reasonable.
+**3 · Guidance applied twice.** If guidance was distilled into the model and you also apply it at sampling time, you're extrapolating an already-extrapolated prediction. The result can be oversaturation and posterised flat regions — the same signature as an over-cranked guidance scale, but arriving at a setting that looks reasonable.
 
-**4 · Prompt-conditioned diversity collapses while aggregate FID can look acceptable.** Few-step models, especially adversarially trained ones, tend to lose sample variety. A distribution-level metric computed over thousands of prompts can look healthy while every image *for a given prompt* has become nearly identical. The check takes two minutes and almost nobody runs it: fix one prompt, vary the seed, look at the spread. Report that alongside FID.
+**4 · Prompt-conditioned diversity collapses while aggregate FID can look acceptable.** Few-step models, especially adversarially trained ones, can lose sample variety. A distribution-level metric computed over thousands of prompts can look healthy while every image *for a given prompt* has become nearly identical. The check takes two minutes and almost nobody runs it: fix one prompt, vary the seed, look at the spread. Report that alongside FID.
 
 **5 · Pointwise distillation transfers the teacher's behaviour.** A student trained to reproduce the teacher's seed-wise mapping will usually inherit systematic weaknesses—including schedule or [terminal-SNR mismatch](03-noise-schedule.qmd)—unless auxiliary data or objectives counteract them. Distribution-level methods are less tightly anchored, which creates both room for improvement and room for drift.
 
@@ -175,7 +177,7 @@ In a serving system it frequently isn't, and the two ways of implementing it fai
 - **Per-sample adaptivity** fragments the batch. Different samples run different numbers of iterations, which means divergent execution and idle GPU while the stragglers finish.
 - **A shared adaptive controller** keeps the batch together but lets the hardest sample in it set the schedule for everyone.
 
-Either can lose to a fixed four-step policy that batches predictably, even when the adaptive method uses fewer evaluations on average. This is a serving trade-off, not a universal result; the crossover depends on batch formation, workload variance, and whether the system can refill partially completed batches. The second failure is exactly the convoy effect from [the continuous batching post](../../llm-systems/inference/continuous-batching/03-continuous-batching.qmd), arriving in a different costume: a batch moves at the speed of its slowest member unless you design against it.
+Either can lose to a fixed four-step policy that batches predictably, even when the adaptive method uses fewer evaluations on average. This is a serving trade-off, not a universal result; the crossover depends on batch formation, workload variance, and whether the system can refill partially completed batches. The second failure is exactly the convoy effect from [the continuous batching post](../llm-systems/03-continuous-batching.qmd), arriving in a different costume: a batch moves at the speed of its slowest member unless you design against it.
 
 ## What's actually worth doing
 
@@ -210,7 +212,7 @@ If one sentence survives: *the number in the paper counts network evaluations, a
 
 ## Where this goes next
 
-Three things this series deliberately left alone. **Video**, where the step count multiplies by frame count and few-step generation is the difference between a demo and a product. **The systems layer** — quantization, kernel work, and distributed inference — which is orthogonal to everything here and often the cheapest win available. And **flow matching itself**, which has been used throughout as the convenient formalism without being derived properly; that derivation is its own post and the natural companion to this one.
+Three things this series deliberately left alone. **Video**, where every denoising evaluation processes many frames at once, so per-step compute and memory grow sharply with sequence length — which is what makes few-step generation the difference between a demo and a product. **The systems layer** — quantization, kernels, compilation and distributed inference — a complementary acceleration axis rather than an independent one, as the caching section above already shows, and often the cheapest win available. And **flow matching itself**, which has been used throughout as the convenient formalism without being derived properly; that derivation is its own post and the natural companion to this one.
 
 ## References
 

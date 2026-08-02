@@ -30,7 +30,7 @@ Diffusion and flow models use several noise parameterisations. A DDPM usually wr
 
 $$z_t = (1-t)\,x + t\,\epsilon,$$
 
-where $x$ is a clean sample, $\epsilon\sim\mathcal N(0,I)$ is Gaussian noise, and $t\in[0,1]$ is the noise level. At $t=0$ the state is data; at $t=1$ it is pure noise. The exact coefficients differ across model families, but the local-versus-finite-step issue studied below does not.
+where $x$ is a clean sample, $\epsilon\sim\mathcal N(0,I)$ is Gaussian noise (a random vector whose coordinates are independent standard Gaussian values), and $t\in[0,1]$ is the noise level. At $t=0$ the state is data; at $t=1$ it is pure noise. The exact coefficients differ across model families, but the local-versus-finite-step issue studied below does not.
 
 A model may predict noise $\epsilon$, the clean sample $x$, a score, or a velocity. Away from the singular endpoint, these are algebraically convertible when the schedule is known. For example,
 
@@ -186,8 +186,12 @@ Watch what happens:
 
 ```{python}
 def fraction_near_a_blob(x):
-    """What share of these points landed within 3 standard deviations of a blob?
-    For real data this should be ~99.7%."""
+    """Fraction of points landing within radius 3σ of either blob centre.
+
+    Careful with the threshold: the familiar 99.7% is the ONE-dimensional
+    figure. For a 2-D isotropic Gaussian the radial distance is Rayleigh, and
+    P(‖x − μ‖ < 3σ) = 1 − exp(−9/2) ≈ 98.9%. That is the ceiling here.
+    """
     distance_to_nearest = (x[:, None, :] - MU).norm(dim=-1).min(dim=1).values
     return (distance_to_nearest < 3 * S).float().mean()
 
@@ -340,7 +344,7 @@ One technical distinction matters: geometric straightness alone is not sufficien
 ## What to carry away
 
 - **The network answers a narrow question**: given this noisy input, what is the *average* clean point consistent with it? Not a plausible sample — the average.
-- **How much it averages over depends on the noise level.** At $t=1$ the input carries no information about any particular sample, so the answer is the mean of the entire dataset — provably, with zero spread across 50,000 different inputs.
+- **How much it averages over depends on the noise level.** At $t=1$ the state carries no information about the *independently paired* clean training sample, so the answer is the mean of the entire dataset — provably, with zero spread across 50,000 different inputs.
 - **The one-step collapse is not model error.** With a perfect denoiser, one step still lands on the dataset mean, because it takes a locally-correct direction and extends it across the entire journey. That is discretisation error, which is a numerical problem with numerical answers.
 - **Sampling doesn't create information** — the seed fixes the output. What changes is how much of it the denoiser can resolve at the current noise level.
 - **Category first, detail later.** In this toy the correct blob is picked within 5% of the trajectory while positioning within it takes more than half. Coarse decisions early, refinement late.
