@@ -246,7 +246,7 @@ If one sentence survives: *a forward schedule controls what you allocate; the ba
 
 ## Where this goes next
 
-The parent post's [FlashAttention chapter](02-flash-attention.qmd) has the identity and the tiling schedule this one assumes. For the memory that dominates at inference time rather than training time — the cache that grows with every token generated — see [the KV cache post](01-kv-cache.qmd), and then [continuous batching](03-continuous-batching.qmd) for what happens when many sequences share one GPU.
+The parent post's [FlashAttention chapter](02-flash-attention.qmd) has the identity and the tiling schedule this one assumes. For the memory that dominates at inference time rather than training time — the cache that grows with every token generated — see [the KV cache post](../kv-cache/index.qmd), and then [continuous batching](../continuous-batching/03-continuous-batching.qmd) for what happens when many sequences share one GPU.
 
 ## References
 

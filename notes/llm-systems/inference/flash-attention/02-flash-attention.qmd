@@ -22,7 +22,7 @@ This post is about what that thing is, why it appears to be unavoidable, and the
 
 ## What attention computes, in one page
 
-A quick self-contained recap, so nothing below rests on remembering the [attention post](../fundamentals/architectures/01-attention-from-scratch.qmd).
+A quick self-contained recap, so nothing below rests on remembering the [attention post](../../../architectures/attention/01-attention-from-scratch.qmd).
 
 Attention is a lookup. Each position in a sequence produces three vectors:
 
@@ -72,7 +72,7 @@ print(f"SRAM is about {sram_bandwidth/hbm_bandwidth:.0f}× faster "
       f"and about {hbm_capacity/sram_capacity:.0f}× smaller")
 ```
 
-**About thirteen times the bandwidth, at about one two-thousandth of the capacity.** One caveat that matters for the comparison below: that 20.7 MB is a *sum* over 108 SMs, not a single shared scratchpad. No tile ever sees more than one SM's 192 KB. The aggregate is the right number for asking whether the score matrix could live on-chip at all; it is far too generous as a tile budget. For bandwidth-bound kernels that trade matters more than peak arithmetic throughput does — the theme of [the GPU cost model post](../fundamentals/tensors/05-how-the-gpu-runs-your-code.qmd), and the reason the FlashAttention paper calls itself *IO-aware*.
+**About thirteen times the bandwidth, at about one two-thousandth of the capacity.** One caveat that matters for the comparison below: that 20.7 MB is a *sum* over 108 SMs, not a single shared scratchpad. No tile ever sees more than one SM's 192 KB. The aggregate is the right number for asking whether the score matrix could live on-chip at all; it is far too generous as a tile budget. For bandwidth-bound kernels that trade matters more than peak arithmetic throughput does — the theme of [the GPU cost model post](../../../fundamentals/tensors/05-how-the-gpu-runs-your-code.qmd), and the reason the FlashAttention paper calls itself *IO-aware*.
 
 Now put the two facts together. A 2 GiB score matrix cannot live in 20 MB of SRAM:
 
@@ -94,7 +94,7 @@ Don't read 64 KiB against 192 KB as "so a row fits, problem solved," though. Tha
 
 ## What stops us: softmax needs the whole row
 
-Softmax turns a row of raw scores into weights that sum to one. The numerically stable form, from [the numerical stability post](../fundamentals/tensors/04-numerical-stability.qmd), is:
+Softmax turns a row of raw scores into weights that sum to one. The numerically stable form, from [the numerical stability post](../../../fundamentals/tensors/04-numerical-stability.qmd), is:
 
 $$\text{softmax}(x)_i = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}}, \qquad m = \max_j x_j$$
 
@@ -303,7 +303,7 @@ def flash_attention(Q, K, V, causal=False, block_q=32, block_k=32):
 
 **Non-square causal alignment.** The mask uses absolute positions from zero, which is *upper-left* alignment — matching what `F.scaled_dot_product_attention` documents for `is_causal=True`. Incremental decoding needs the other convention, with query positions offset by the cache length.
 
-**Arbitrary masks.** The implementation assumes every non-empty query row has at least one valid key, which upper-left causal masking guarantees (query *i* can always see key *i*). Add a padding mask or an arbitrary mask and fully-masked rows become possible — at which point `P = exp(S - m_new)` computes `exp(-inf − (-inf))`, which is **NaN**. That needs an explicit policy, which is the fully-masked-row discussion in [the numerical stability post](../fundamentals/tensors/04-numerical-stability.qmd).
+**Arbitrary masks.** The implementation assumes every non-empty query row has at least one valid key, which upper-left causal masking guarantees (query *i* can always see key *i*). Add a padding mask or an arbitrary mask and fully-masked rows become possible — at which point `P = exp(S - m_new)` computes `exp(-inf − (-inf))`, which is **NaN**. That needs an explicit policy, which is the fully-masked-row discussion in [the numerical stability post](../../../fundamentals/tensors/04-numerical-stability.qmd).
 
 **A memory-efficient backward pass.** The returned `L` is what a real backward pass needs, but this function relies on ordinary autograd — which has a consequence large enough that it gets [its own post](02b-what-autograd-saves.qmd).
 :::
@@ -488,7 +488,7 @@ for T in [1024, 8192, 65536, 524288]:
 
 So the honest statement is that the I/O advantage **becomes relevant** at long contexts and saturates at a constant set by your hardware and head width — not that it improves indefinitely. Within this counting model that constant is exactly `M/d²`; the underlying result is asymptotic, so read it as a proportionality rather than a number to quote.
 
-This post was written without a GPU, so it contains no speedup measurement at all. The mechanism is sound and the published benchmarks are substantial; for a figure on *your* shapes and hardware, use the harness from [the GPU cost model post](../fundamentals/tensors/05-how-the-gpu-runs-your-code.qmd) — warm up, synchronize, repeat, record the environment.
+This post was written without a GPU, so it contains no speedup measurement at all. The mechanism is sound and the published benchmarks are substantial; for a figure on *your* shapes and hardware, use the harness from [the GPU cost model post](../../../fundamentals/tensors/05-how-the-gpu-runs-your-code.qmd) — warm up, synchronize, repeat, record the environment.
 
 ## What it doesn't solve
 
@@ -496,7 +496,7 @@ Some scope, since "FlashAttention" gets used as shorthand for "attention is solv
 
 **It doesn't change the arithmetic asymptotics.** Attention is still `O(T²d)` multiplications. FlashAttention removes the `O(T²)` *memory*, which was the thing actually breaking, but compute still grows quadratically. Linear-attention variants attack the other axis and make different trade-offs.
 
-**It helps much less at decode time.** Generating one token at a time means one query against a cached history — there is no `T×T` matrix to avoid, so the quadratic saving isn't there. Decode is bound instead by reading the KV cache and finding enough parallelism, which is [the KV cache post's](01-kv-cache.qmd) subject. A fused kernel still helps somewhat (fewer buffers, fewer launches), and **Flash-Decoding** adapts the same online-reduction identity by splitting the *key* axis across parallel workers and combining partial results — a nice demonstration that the identity, rather than the tiling schedule, is the reusable part.
+**It helps much less at decode time.** Generating one token at a time means one query against a cached history — there is no `T×T` matrix to avoid, so the quadratic saving isn't there. Decode is bound instead by reading the KV cache and finding enough parallelism, which is [the KV cache post's](../kv-cache/index.qmd) subject. A fused kernel still helps somewhat (fewer buffers, fewer launches), and **Flash-Decoding** adapts the same online-reduction identity by splitting the *key* axis across parallel workers and combining partial results — a nice demonstration that the identity, rather than the tiling schedule, is the reusable part.
 
 **The kernel is hardware-specific, and it keeps moving.** Each generation retunes the same algorithm as the bottleneck shifts:
 
