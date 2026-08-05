@@ -20,6 +20,8 @@ It does not. Measured below, the tiled implementation retains *more* state for i
 
 > **TL;DR** — PyTorch stashes tensors during the forward pass for the backward pass to reuse. A tiled attention forward produces a few small tensors per tile and hundreds or thousands of tiles, and autograd keeps all of them: quadratic in total, roughly twice the dense baseline, even though no single retained tensor is ever larger than one tile. Recomputation changes the scaling: wrapping the same function in `torch.utils.checkpoint` takes the retained payload down to the three inputs and nothing else, with gradients unchanged. That demonstrates the recomputation principle behind FlashAttention's custom backward, and why the algorithm needs one rather than just a clever loop.
 
+![](autograd-saves-figure.png)
+
 ## The implementation under test
 
 Self-contained, and deliberately the same recurrence as the parent post — outer loop over query blocks, inner loop over key blocks, three running statistics per row, one rescale when the maximum moves. The tile traversal and the online-softmax update are unchanged. Everything that would clutter the autograd graph without changing it is gone: input validation, device and accumulation-dtype handling, causal masking and the empty-key policy. This is a CPU float32 experiment throughout.

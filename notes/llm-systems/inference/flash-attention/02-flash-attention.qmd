@@ -53,9 +53,7 @@ At a 32k context, **one fp16 head holds about 12 MiB of Q, K and V, while a mate
 
 Then it uses the table exactly once, to compute a weighted average, and throws it away.
 
-## The part most explanations skip: a GPU has two memories
-
-Everything that follows turns on a fact about hardware that's easy to never learn, so it's worth stating plainly.
+## A GPU has two memories
 
 A GPU actually has several tiers — registers, an on-chip shared-memory/L1 pool, an L2 cache, and main memory. For this argument two of them carry the whole story, so I'll collapse it to two quite different places to put numbers.
 
@@ -196,6 +194,7 @@ $$m_{\text{new}} = \max\big(m,\ \text{rowmax}(S)\big), \qquad \alpha = e^{m - m_
 $$P = e^{S - m_{\text{new}}}, \qquad \ell \leftarrow \alpha\,\ell + \text{rowsum}(P), \qquad O \leftarrow \alpha\,O + P V$$
 
 Two details worth noticing before the code. **The maximum is replaced, not rescaled** — only the two accumulators live in a reference frame that has to be shifted. And **deferring the final division** to the very end is a real refinement: FlashAttention-1 kept a normalized output through every tile, and [FlashAttention-2](https://arxiv.org/abs/2307.08691) reformulated the loop to avoid that per-tile division, which is one of several ways it cut non-matmul work.
+![](flash-attention-figure.png)
 
 ## Build it
 
