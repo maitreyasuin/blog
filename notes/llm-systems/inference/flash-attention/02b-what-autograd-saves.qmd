@@ -1,0 +1,256 @@
+---
+title: "What Ordinary Autograd Saves: Tiling the Forward Pass Is Only Half the Algorithm"
+description: "A tiled attention forward never builds the T×T score matrix, yet ordinary autograd can retain quadratic aggregate state for the backward pass — more than the dense implementation it replaces. This post measures that behaviour and shows how recomputation changes the scaling."
+categories: [llm-systems, training, attention, autograd]
+date: 2026-07-21
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+[The FlashAttention post](02-flash-attention.qmd) ended with a tiled implementation that never constructs a `T×T` tensor. The largest query-by-key object it ever builds is one small tile, and the tests confirm it.
+
+That is a claim about the **forward** pass. Training needs the backward pass, and there is a widespread assumption — reasonable, and wrong — that a memory-efficient forward gives you memory-efficient training for free.
+
+It does not. Measured below, the tiled implementation retains *more* state for its backward pass than the dense implementation it was written to replace, while keeping its promise never to build a large tensor. Both of those things are true at once, and the reason they're compatible is the whole point of this post.
+
+> **TL;DR** — PyTorch stashes tensors during the forward pass for the backward pass to reuse. A tiled attention forward produces a few small tensors per tile and hundreds or thousands of tiles, and autograd keeps all of them: quadratic in total, roughly twice the dense baseline, even though no single retained tensor is ever larger than one tile. Recomputation changes the scaling: wrapping the same function in `torch.utils.checkpoint` takes the retained payload down to the three inputs and nothing else, with gradients unchanged. That demonstrates the recomputation principle behind FlashAttention's custom backward, and why the algorithm needs one rather than just a clever loop.
+
+## The implementation under test
+
+Self-contained, and deliberately the same recurrence as the parent post — outer loop over query blocks, inner loop over key blocks, three running statistics per row, one rescale when the maximum moves. The tile traversal and the online-softmax update are unchanged. Everything that would clutter the autograd graph without changing it is gone: input validation, device and accumulation-dtype handling, causal masking and the empty-key policy. This is a CPU float32 experiment throughout.
+
+```{python}
+#| code-fold: true
+#| code-summary: "The tiled forward pass (unchanged from the FlashAttention post)"
+import torch, math
+from torch.utils.checkpoint import checkpoint
+
+torch.set_num_threads(1)
+print("torch", torch.__version__)
+
+
+def flash_attention(Q, K, V, block_q=32, block_k=32):
+    """Tiled attention with online softmax. Never builds a (Tq, Tk) tensor."""
+    Tq, d = Q.shape
+    Tk, dv = K.shape[0], V.shape[1]
+    scale = 1.0 / math.sqrt(d)
+    O = torch.zeros(Tq, dv)
+    L = torch.zeros(Tq)
+
+    for i in range(0, Tq, block_q):
+        n_q = min(block_q, Tq - i)
+        Qi = Q[i:i + n_q]
+        Oi = torch.zeros(n_q, dv)                    # unnormalized output so far
+        mi = torch.full((n_q,), -torch.inf)          # largest score so far
+        li = torch.zeros(n_q)                        # sum of exponentials so far
+
+        for j in range(0, Tk, block_k):
+            n_k = min(block_k, Tk - j)
+            Kj, Vj = K[j:j + n_k], V[j:j + n_k]
+            S = (Qi @ Kj.T) * scale                  # the only matrix built
+            m_new = torch.maximum(mi, S.max(dim=-1).values)
+            alpha = torch.where(torch.isneginf(mi), torch.zeros_like(mi),
+                                torch.exp(mi - m_new))
+            P = torch.exp(S - m_new[:, None])
+            li = li * alpha + P.sum(dim=-1)
+            Oi = Oi * alpha[:, None] + P @ Vj
+            mi = m_new
+
+        O[i:i + n_q] = Oi / li[:, None]              # normalize once, at the end
+        L[i:i + n_q] = mi + torch.log(li)
+    return O, L
+
+
+def dense_attention(Q, K, V):
+    """The obvious implementation, same dtype, as a baseline."""
+    S = (Q @ K.T) / math.sqrt(Q.shape[-1])
+    return torch.softmax(S, -1) @ V
+```
+
+## Looking at what autograd keeps
+
+PyTorch decides what the backward pass will need *while the forward pass runs*. Each operation that will need one of its inputs or outputs again stashes a reference, and those references keep the tensor alive until backward has run. That is the memory people mean by "activations."
+
+`saved_tensors_hooks` intercepts each tensor at the moment it is stashed, which is enough to count what is being held:
+
+```{python}
+class SavedPayload:
+    """Count the tensors autograd stashes for the backward pass.
+
+    Counted in bytes, not elements: this graph stashes bool and int64 tensors
+    alongside the float32 ones, and they do not cost the same. Keyed so that a
+    buffer stashed by several operations counts once, while genuinely distinct
+    views of one storage still count separately — see the note below.
+
+    `pack` returns a detached tensor rather than its argument: the docs are
+    explicit that the return value must not hold a reference to the input,
+    or the graph and the saved value form a cycle. It shares the same
+    underlying storage, so the tensor data is not copied and the totals are
+    identical either way.
+    """
+    def __init__(self):
+        self.seen, self.bytes, self.save_events, self.largest = set(), 0, 0, 0
+
+    def pack(self, t):
+        self.save_events += 1
+        self.largest = max(self.largest, t.numel())
+        key = (t.untyped_storage().data_ptr(), t.storage_offset(),
+               tuple(t.shape), tuple(t.stride()), t.dtype)
+        if key not in self.seen:
+            self.seen.add(key)
+            self.bytes += t.numel() * t.element_size()   # bytes, not elements
+        return t.detach()
+
+
+def payload_of(fn, *args):
+    """Run forward and backward, reporting what autograd held on to."""
+    p = SavedPayload()
+    with torch.autograd.graph.saved_tensors_hooks(p.pack, lambda t: t):
+        out = fn(*args)
+        (out[0] if isinstance(out, tuple) else out).sum().backward()
+    return p
+```
+
+Two things this number is and isn't, because the distinction matters for how much weight the result can bear.
+
+**It is the payload autograd retains, not allocator peak memory.** Peak allocation also depends on fragmentation, buffer reuse and when tensors actually die; measuring that properly means `torch.cuda.max_memory_allocated`, not a hook. What's counted here is what the graph is holding onto, which is the quantity the algorithm is actually about.
+
+**Deduplication is a judgement call, and it turns out not to matter much.** Counting every interception naively inflates the totals about two and a half times. Going the other way, keying on the underlying storage alone, changes the total by about one percent in this experiment and alters neither the scaling nor the comparison.
+
+**It also includes storage the caller already owns.** `Q`, `K` and `V` are reachable through saved tensors, so they appear in every total below. The metric is what the backward graph retains access to, not the incremental allocation attributable to autograd alone — which matters for reading the checkpointed result later.
+
+## The measurement
+
+```{python}
+d = dv = 32
+tiled = lambda Q, K, V: flash_attention(Q, K, V, block_q=32, block_k=32)
+
+print(f"{'T':>6} {'tiled KiB':>12} {'dense KiB':>12} {'ratio':>7} "
+      f"{'save events':>12} {'largest elem':>13}")
+previous = None
+for T in [128, 256, 512, 1024]:
+    torch.manual_seed(0)
+    Q, K, V = (torch.randn(T, w, requires_grad=True) for w in (d, d, dv))
+    a = payload_of(tiled, Q, K, V)
+    for t in (Q, K, V):
+        t.grad = None
+    b = payload_of(dense_attention, Q, K, V)
+    growth = f"  ×{a.bytes/previous:.2f}" if previous else ""
+    previous = a.bytes
+    print(f"{T:>6} {a.bytes/1024:>12,.0f} {b.bytes/1024:>12,.0f} "
+          f"{a.bytes/b.bytes:>6.2f}× {a.save_events:>12,} {a.largest:>13,}{growth}")
+```
+
+Three readings, and the third explains the other two.
+
+**The payload is quadratic.** Each doubling of `T` multiplies it by about 3.4, then 3.6, then 3.8 — climbing toward four. Whatever the forward pass avoided, the backward pass has put back.
+
+**The tiled version retains more than the dense one it was written to replace** — roughly twice as much, with the gap widening as `T` grows.
+
+**And it never breaks its promise.** The largest single tensor it stashes is 1,024 elements — one 32×32 tile — at *every* sequence length tested. The dense implementation stashes a handful of tensors, the biggest of them `T×T`. The tiled one stashes thousands of small ones.
+
+That last line is the mechanism. **Autograd doesn't retain the largest thing you built; it retains everything it will need again.** Each tile causes several tile-sized tensors to be stashed, along with row-sized recurrence state; sorting the intercepted tensors by shape puts about 90% of the payload in `(32, 32)` tiles and most of the rest in row vectors. No individual save is quadratic, but their union covers the query–key surface anyway — rather more than once over, since a backward through this recurrence needs more per tile than the dense path's softmax backward needs of its own output.
+
+The tiled forward avoided *allocating* the score matrix. It did not avoid *remembering* it.
+
+One caution on reading the table too closely: the exact counts are a property of this PyTorch version's graph, these shapes and this block size. The quadratic scaling and the direction of the comparison are the durable results; the specific integers are a diagnostic, not a constant of nature.
+
+## The way out is recomputation, not a better forward pass
+
+You could try to shave the per-tile bookkeeping, and it wouldn't help — the quadratic term is the tiles themselves, and they are the algorithm.
+
+The way out is that stashing a tensor is not the only way to have it during backward. You can also build it again. Same function, same block size, one line different:
+
+```{python}
+def tiled_recompute(Q, K, V):
+    """Stash the inputs; rebuild what backward needs instead of storing it."""
+    return checkpoint(lambda q, k, v: flash_attention(q, k, v, block_q=32,
+                                                      block_k=32)[0],
+                      Q, K, V, use_reentrant=False)
+
+print(f"{'T':>6} {'stored KiB':>12} {'recomp KiB':>12} {'saved':>8} {'3Td KiB':>10}")
+previous = None
+for T in [128, 256, 512, 1024]:
+    torch.manual_seed(0)
+    Q, K, V = (torch.randn(T, w, requires_grad=True) for w in (d, d, dv))
+    a = payload_of(tiled, Q, K, V)
+    for t in (Q, K, V):
+        t.grad = None
+    c = payload_of(tiled_recompute, Q, K, V)
+    growth = f"  ×{c.bytes/previous:.2f}" if previous else ""
+    previous = c.bytes
+    print(f"{T:>6} {a.bytes/1024:>12,.0f} {c.bytes/1024:>12,.0f} "
+          f"{a.bytes/c.bytes:>7.1f}× {3*T*d*4/1024:>10,.0f}{growth}")
+```
+
+Exactly linear — two per doubling, not four. And the last column is the part worth pausing on: on this build the recomputed payload doesn't merely resemble `3Td`, it **equals** it. Autograd is holding `Q`, `K` and `V` and nothing else at all; every intermediate between the inputs and the answer is rebuilt on demand. The exact equality is an implementation detail and may not survive a version bump. The durable result is the shape of the curve: retained state becomes linear and input-sized instead of quadratic.
+
+The reduction is about 4× at `T = 128` and 25× at `T = 1024`, and it keeps growing, because one side of that ratio is quadratic and the other is linear.
+
+The obvious worry is whether this is still the same function:
+
+```{python}
+torch.manual_seed(2)
+T = 128
+Q, K, V = (torch.randn(T, w, requires_grad=True) for w in (d, d, dv))
+upstream = torch.randn(T, dv)                    # a random cotangent, not all-ones
+
+out = tiled_recompute(Q, K, V)
+ref = dense_attention(Q, K, V)
+torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+
+(out * upstream).sum().backward()
+grads = [Q.grad.clone(), K.grad.clone(), V.grad.clone()]
+for t in (Q, K, V):
+    t.grad = None
+(dense_attention(Q, K, V) * upstream).sum().backward()
+
+for name, g, ref in zip("QKV", grads, (Q.grad, K.grad, V.grad)):
+    torch.testing.assert_close(g, ref, atol=1e-5, rtol=1e-5)
+    print(f"  d{name}: max abs difference {(g - ref).abs().max():.1e}")
+print("  recomputation changes the memory, not the answer")
+```
+
+Nothing is free here. What has been bought with memory is arithmetic: the forward work inside the checkpoint is done a second time during backward. `use_reentrant=False` stops recomputing once everything the backward needs has been regenerated, so it isn't always a complete replay — but for a function like this one, where the last operations depend on nearly everything before them, it is close to one.
+
+## Why this is FlashAttention's second idea
+
+The paper describes **two** techniques, and the parent post only built one of them.
+
+The first is tiling with online softmax, which keeps the forward pass's working set small. The second is a custom backward pass: beyond `Q`, `K` and `V`, which it needs like any other implementation, it keeps the output `O` and the row statistics `L` — which is why the tiled function bothers to return `L` at all — and *rebuilds* the score and probability tiles from those when the gradients need them. What it declines to store is precisely the quadratic part.
+
+`checkpoint` above is a control, not a substitute. It recomputes broadly from the inputs, including the row statistics that FlashAttention keeps precisely so it doesn't have to, and it has none of the kernel's control over traffic, scheduling or accumulation. What it establishes is the thing worth establishing: the quadratic saved state is not mathematically necessary. Closing the rest of the gap is what the custom backward is for.
+
+And recomputation inside FlashAttention is a far better deal than it sounds, for the reason the parent post is about. Recomputing tiles costs arithmetic and saves memory traffic — the rebuilt tiles are constructed in on-chip memory, while the stored ones would have had to travel back from HBM. When traffic is the binding constraint, that trade runs in your favour. It's the same bargain as the forward pass, struck a second time.
+
+## What this doesn't mean
+
+**The forward tiling is not wasted.** Under `torch.no_grad()` — inference, which is what most of this series is about — nothing is stashed at all, and the tiled implementation does exactly what it advertises. The gap measured here is specific to training.
+
+**And a tiled Python forward is not a broken implementation**, it's an incomplete one. It solves the problem it set out to solve. It just doesn't solve the adjacent problem that people assume comes along with it.
+
+## What to carry away
+
+- **Autograd retains what it will need again, not what was biggest.** An implementation can hold thousands of small tensors and still exceed one that holds a handful of large ones.
+- **A tiled forward pass gives you memory-efficient inference, not memory-efficient training.** Under ordinary autograd the retained state is quadratic — here about twice the dense baseline — even though no single tensor exceeds one tile.
+- **Recomputation is the second technique, not an optimization on top of the first.** On the build measured here, checkpointing the same function takes the retained payload down to the three inputs and leaves the gradients unchanged.
+- **FlashAttention's backward keeps `O` and `L` and rebuilds the rest**, which is cheap in the specific sense that matters on a GPU: it spends arithmetic to avoid HBM traffic.
+- **Measure the thing you're claiming.** `saved_tensors_hooks` reports retained payload; allocator peak is a different quantity and needs a different tool.
+
+If one sentence survives: *a forward schedule controls what you allocate; the backward and recomputation strategy control what has to stay alive.*
+
+## Where this goes next
+
+The parent post's [FlashAttention chapter](02-flash-attention.qmd) has the identity and the tiling schedule this one assumes. For the memory that dominates at inference time rather than training time — the cache that grows with every token generated — see [the KV cache post](01-kv-cache.qmd), and then [continuous batching](03-continuous-batching.qmd) for what happens when many sequences share one GPU.
+
+## References
+
+- Dao et al., [*FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*](https://arxiv.org/abs/2205.14135), 2022 — §3.1 for the recomputing backward and the argument that its extra FLOPs are cheaper than the traffic they replace.
+- [`torch.utils.checkpoint`](https://pytorch.org/docs/stable/checkpoint.html) — the non-reentrant implementation used above, and its early-stopping behaviour.
+- [`torch.autograd.graph.saved_tensors_hooks`](https://pytorch.org/docs/stable/autograd.html) — the interception point for saved tensors.
+- Chen et al., [*Training Deep Nets with Sublinear Memory Cost*](https://arxiv.org/abs/1604.06174), 2016 — gradient checkpointing, the general form of the trade made here.

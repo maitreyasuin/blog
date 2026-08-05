@@ -1,6 +1,6 @@
 ---
 title: "FlashAttention: The Matrix You Never Have to Write Down"
-description: "Attention builds one number for every pair of words, uses it once, and throws it away. At long context lengths that throwaway table is larger than the model's activations. This post explains why it gets built, why the softmax seems to require it, and the one identity that turns out to make it unnecessary."
+description: "Attention builds one number for every pair of words, uses it once, and throws it away. At long context lengths that throwaway table dwarfs the tensors that produced it. This post explains why it gets built, why the softmax seems to require it, and the one identity that turns out to make it unnecessary."
 categories: [llm-systems, inference, attention]
 date: 2026-07-21
 depth: "Deep dive"
@@ -12,17 +12,17 @@ execute:
   freeze: auto
 ---
 
-For years, the reason you couldn't paste a whole book into a language model was not that the model didn't understand long documents. It was that attention's memory grows with the **square** of the input length. Double the context and you quadruple the memory. Somewhere around a few thousand tokens, a single attention layer stopped fitting on the GPU.
+Long context has never had a single obstacle — training data, positional extrapolation, quadratic compute and KV-cache traffic all push back. But for years one of them was blunter than the rest, and it was a storage problem rather than a modelling one: a conventional attention implementation builds one number for every query–key pair, so its scratch space grows with the **square** of the input length. Double the context and you quadruple it.
 
-FlashAttention removed that wall — not by approximating attention, not by dropping any of the computation, but by noticing that the enormous thing in the middle never actually needs to exist.
+FlashAttention removed that wall — not by approximating the attention function, but by noticing that the enormous thing in the middle never actually needs to exist.
 
 This post is about what that thing is, why it appears to be unavoidable, and the single mathematical identity that makes it avoidable.
 
-> **TL;DR** — Attention computes a score for every (query, key) pair, giving a `T×T` table that gets used once and discarded. It has to be built because softmax needs the sum over an entire row before it can normalize any single entry — a global operation that seems to demand having the whole row on hand. *Online softmax* dissolves that: keep a running maximum and a running sum, and **when a later block raises the maximum, rescale what you've already accumulated into the new reference frame**. FlashAttention applies that same rescaling to the *output* as well, which is what turns a softmax trick into an attention algorithm. Below: a tiled implementation verified against a float64 reference, and what happens if you drop the rescale — a 22% error, correct shape, no exception.
+> **TL;DR** — Attention computes a score for every (query, key) pair, giving a `T×T` table that gets used once and discarded. It has to be built because softmax needs the sum over an entire row before it can normalize any single entry — a global operation that seems to demand having the whole row on hand. *Online softmax* dissolves that: keep a running maximum and a running sum, and **when a later block raises the maximum, rescale what you've already accumulated into the new reference frame**. FlashAttention applies that same rescaling to the *output* as well, which is what turns a softmax trick into an attention algorithm. Below: a tiled implementation verified against a float64 reference, and why the forward pass is only half of what FlashAttention actually does.
 
 ## What attention computes, in one page
 
-A quick self-contained recap, so nothing below rests on remembering the [attention post](../../../architectures/attention/01-attention-from-scratch.qmd).
+A quick self-contained recap, so nothing below rests on remembering the [attention post](../fundamentals/architectures/01-attention-from-scratch.qmd).
 
 Attention is a lookup. Each position in a sequence produces three vectors:
 
@@ -49,7 +49,7 @@ for T in [1024, 8192, 32768]:
     print(f"{T:>10} {inputs:>11.1f} MiB {scores:>12.1f} MiB {scores/inputs:>7.1f}×")
 ```
 
-At a 32k context, **one fp16 head holds about 12 MiB of Q, K and V, while a materialized implementation creates a 2 GiB score tensor.** That's one head — a real model has dozens per layer and dozens of layers. In training the pressure is worse: the forward path materializes quadratic score *and* probability tensors, and the backward pass needs either those saved intermediates or a way to recompute them. Exactly which tensors survive depends on the framework's lifetime analysis and fusion, so the peak isn't a fixed multiple — but it is never smaller.
+At a 32k context, **one fp16 head holds about 12 MiB of Q, K and V, while a materialized implementation creates a 2 GiB score tensor.** That's one head — a real model has dozens per layer and dozens of layers. In training the pressure is worse: the forward path materializes quadratic score *and* probability tensors, and the backward pass needs either those saved intermediates or a way to recompute them. Exactly which tensors survive depends on the framework's lifetime analysis and fusion, so the peak isn't a fixed multiple.
 
 Then it uses the table exactly once, to compute a weighted average, and throws it away.
 
@@ -57,7 +57,7 @@ Then it uses the table exactly once, to compute a weighted average, and throws i
 
 Everything that follows turns on a fact about hardware that's easy to never learn, so it's worth stating plainly.
 
-A GPU has two quite different places to put numbers.
+A GPU actually has several tiers — registers, an on-chip shared-memory/L1 pool, an L2 cache, and main memory. For this argument two of them carry the whole story, so I'll collapse it to two quite different places to put numbers.
 
 **HBM** (high-bandwidth memory) is the big one — the "40 GB" or "80 GB" in the spec sheet. Despite the name, it is the *slow* one. **SRAM** is on-chip memory sitting right next to the arithmetic units: tiny, and much faster. Using the A100 figures from the FlashAttention paper itself:
 
@@ -72,7 +72,7 @@ print(f"SRAM is about {sram_bandwidth/hbm_bandwidth:.0f}× faster "
       f"and about {hbm_capacity/sram_capacity:.0f}× smaller")
 ```
 
-**About thirteen times the bandwidth, about two thousandths of the capacity.** That trade governs GPU performance far more than raw arithmetic speed does — the theme of [the GPU cost model post](../../../fundamentals/tensors/05-how-the-gpu-runs-your-code.qmd), and the reason the FlashAttention paper calls itself *IO-aware*.
+**About thirteen times the bandwidth, at about one two-thousandth of the capacity.** One caveat that matters for the comparison below: that 20.7 MB is a *sum* over 108 SMs, not a single shared scratchpad. No tile ever sees more than one SM's 192 KB. The aggregate is the right number for asking whether the score matrix could live on-chip at all; it is far too generous as a tile budget. For bandwidth-bound kernels that trade matters more than peak arithmetic throughput does — the theme of [the GPU cost model post](../fundamentals/tensors/05-how-the-gpu-runs-your-code.qmd), and the reason the FlashAttention paper calls itself *IO-aware*.
 
 Now put the two facts together. A 2 GiB score matrix cannot live in 20 MB of SRAM:
 
@@ -86,7 +86,7 @@ print(f"a single row of it:    {one_row/1024:>8.0f} KiB  (fp16; {one_row*2/1024:
       f" accumulated in fp32)")
 ```
 
-So the matrix has to go to HBM, which means writing 2 GiB out and reading it back — twice, since softmax reads the scores and the weighted average reads the probabilities. **The cost of attention at long context is not the multiplications. It is the round trips.**
+So the matrix has to go to HBM, and it makes the trip four times: the scores are written, read back for the softmax, the probabilities are written, and read back for the product with `V`. **At these shapes the cost of attention is not the multiplications. It is the round trips.**
 
 But notice the second line. A single *row* is four orders of magnitude smaller than the full matrix — small enough that working a piece at a time is clearly the right shape of idea.
 
@@ -94,7 +94,7 @@ Don't read 64 KiB against 192 KB as "so a row fits, problem solved," though. Tha
 
 ## What stops us: softmax needs the whole row
 
-Softmax turns a row of raw scores into weights that sum to one. The numerically stable form, from [the numerical stability post](../../../fundamentals/tensors/04-numerical-stability.qmd), is:
+Softmax turns a row of raw scores into weights that sum to one. The numerically stable form, from [the numerical stability post](../fundamentals/tensors/04-numerical-stability.qmd), is:
 
 $$\text{softmax}(x)_i = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}}, \qquad m = \max_j x_j$$
 
@@ -150,29 +150,34 @@ That factor $e^{m - m_{\text{new}}}$ is the whole trick. Because the maximum onl
 def streaming_logsumexp(x, block=7):
     """Compute log(Σ exp(x)) in ONE pass, holding only two numbers.
 
-    The dense version needs the whole vector in memory twice: once to find the
-    maximum, once to sum. This version keeps a running (max, sum) and repairs
-    the sum whenever the max moves.
+    The stable dense version traverses the input twice: once to find the
+    maximum, once to sum the shifted exponentials. This version traverses it
+    once, keeping a running (max, sum) and repairing the sum when the max moves.
     """
     m, l = -float('inf'), 0.0                      # max seen so far; sum so far
     for i in range(0, len(x), block):
         blk = x[i:i + block]
-        m_new = max(m, blk.max().item())           # the max may have just grown
-        rescale = math.exp(m - m_new)              # ...so shrink the old sum to match
+        block_max = blk.max().item()
+        if block_max == -float('inf'):
+            continue                               # a block of pure -inf adds nothing
+        m_new = max(m, block_max)                  # the max may have just grown
+        rescale = 0.0 if m == -float('inf') else math.exp(m - m_new)
         l = l * rescale + torch.exp(blk - m_new).sum().item()
         m = m_new
-    return m + math.log(l)
+    return -float('inf') if l == 0.0 else m + math.log(l)
+
+assert streaming_logsumexp(torch.full((4,), -torch.inf)) == -float('inf')
 
 x = torch.randn(1000) * 10                          # spread out, so the max really moves
 print(f"streaming, 7 at a time: {streaming_logsumexp(x):.8f}")
 print(f"dense, all at once:     {torch.logsumexp(x, 0).item():.8f}")
 assert abs(streaming_logsumexp(x) - torch.logsumexp(x, 0).item()) < 1e-4
-print("agree — constant memory, one pass  ✓")
+print("agree — one traversal, constant-size state  ✓")
 ```
 
-Notice the initialization handles itself: starting from `m = -inf`, the first rescale factor is `exp(-inf - m_new) = 0`, which correctly wipes an empty sum.
+Two guards earn their place. The first rescale factor has to be *forced* to zero rather than computed, because starting from `m = -inf` gives `-inf - (-inf)`, which is `NaN`. That isn't a contrived input — it is exactly a fully masked row, which this chapter runs into again under causal masking. A block of pure `-inf` contributes nothing and is skipped, and if every block was empty the answer is `-inf` rather than `log(0)`. (This is deliberately written with scalars for readability. On a GPU each `.item()` would force the device to synchronize with the host — a real kernel keeps both statistics on-chip and never brings them back.)
 
-This identity is not FlashAttention's. Milakov and Gimelshein published it in 2018 for softmax alone. **FlashAttention's contribution is realising that the same rescaling applies to the attention *output*** — and then building the tiling schedule and fused GPU kernel that make it pay.
+None of this is FlashAttention's. Milakov and Gimelshein published the online normalizer in 2018 for softmax alone, and Rabe and Staats showed in 2021 that exact attention can accumulate the numerator alongside the denominator, so it needs no quadratic storage. **The memory result was already known.** What FlashAttention contributed was turning it into a fast algorithm on real hardware: an IO-aware tiling schedule matched to the memory hierarchy, fused execution that keeps the tile on-chip, and a backward pass that reconstructs the quadratic intermediates instead of storing them.
 
 ## From softmax to attention: rescale the output too
 
@@ -197,7 +202,7 @@ Two details worth noticing before the code. **The maximum is replaced, not resca
 ::: {.callout-note}
 ## What this implementation is for
 
-A readable specification of the forward pass, not a production kernel. One attention head, rank-2 tensors, optional causal masking, fp32 accumulation, no dropout or attention bias. It does **not** implement FlashAttention's memory-efficient backward pass, and being a Python double loop it is far slower than either the fused kernel or the naive implementation. Its job is to let you check the recurrence against a reference and see exactly where the rescale goes.
+A readable specification of the forward pass, not a production kernel. One attention head, rank-2 tensors, optional causal masking, no dropout or attention bias. Half-precision inputs are converted to fp32 tiles and the whole recurrence runs in fp32 — reference arithmetic, not the mixed-precision matmul-with-fp32-accumulate a real kernel performs. It does **not** implement FlashAttention's memory-efficient backward pass, and being a Python double loop it is far slower than either the fused kernel or the naive implementation. Its job is to let you check the recurrence against a reference and see exactly where the rescale goes.
 :::
 
 The input contract first, kept separate so the algorithm itself reads cleanly:
@@ -298,9 +303,9 @@ def flash_attention(Q, K, V, causal=False, block_q=32, block_k=32):
 
 **Non-square causal alignment.** The mask uses absolute positions from zero, which is *upper-left* alignment — matching what `F.scaled_dot_product_attention` documents for `is_causal=True`. Incremental decoding needs the other convention, with query positions offset by the cache length.
 
-**Arbitrary masks.** The implementation assumes every non-empty query row has at least one valid key, which upper-left causal masking guarantees (query *i* can always see key *i*). Add a padding mask or an arbitrary mask and fully-masked rows become possible — at which point `P = exp(S - m_new)` computes `exp(-inf − (-inf))`, which is **NaN**. That needs an explicit policy, which is the fully-masked-row discussion in [the numerical stability post](../../../fundamentals/tensors/04-numerical-stability.qmd).
+**Arbitrary masks.** The implementation assumes every non-empty query row has at least one valid key, which upper-left causal masking guarantees (query *i* can always see key *i*). Add a padding mask or an arbitrary mask and fully-masked rows become possible — at which point `P = exp(S - m_new)` computes `exp(-inf − (-inf))`, which is **NaN**. That needs an explicit policy, which is the fully-masked-row discussion in [the numerical stability post](../fundamentals/tensors/04-numerical-stability.qmd).
 
-**A memory-efficient backward pass.** The returned `L` is what a real backward pass needs, but this function relies on ordinary autograd, which saves an intermediate for *every tile* — and those collectively scale quadratically. So this is memory-efficient as a forward demonstration and **not** as a training implementation. Production FlashAttention stores only `O` and the row statistics, then *recomputes* the tiles inside a custom backward. That recomputation is central to its training-memory benefit.
+**A memory-efficient backward pass.** The returned `L` is what a real backward pass needs, but this function relies on ordinary autograd — which has a consequence large enough that it gets [its own post](02b-what-autograd-saves.qmd).
 :::
 
 ## Check it
@@ -380,74 +385,49 @@ assert torch.equal(O_empty, torch.zeros(3, 5)) and torch.isneginf(L_empty).all()
 print(f"{'empty key sequence':22s} → zeros and −inf, by policy  ✓")
 ```
 
+Exactness against a reference tests the *answer*. There is a second property worth testing, which is about the *method*: unmasked attention, with no position-dependent bias, is invariant to a joint permutation of the key–value pairs. Reorder them together and the result must not move. (Causal attention is not, since the permutation moves keys relative to the mask — which is the mask's whole purpose.) That is a useful thing to check on a blocked implementation specifically, because processing order and block boundaries are exactly what tiling introduces:
+
+```{python}
+torch.manual_seed(3)
+Q, K, V = torch.randn(96, 32), torch.randn(96, 32), torch.randn(96, 24)
+perm = torch.randperm(96)                       # same pairs, different order
+
+o1, l1 = flash_attention(Q, K,       V,       block_q=7, block_k=13)
+o2, l2 = flash_attention(Q, K[perm], V[perm], block_q=7, block_k=13)
+
+torch.testing.assert_close(o1, o2, atol=1e-6, rtol=1e-6)
+torch.testing.assert_close(l1, l2, atol=1e-6, rtol=1e-6)
+print(f"output moves by {(o1 - o2).abs().max():.1e} — agreement to floating-point tolerance")
+```
+
+With block sizes of 7 and 13 the permutation also changes which elements land in which tile, so this catches a recurrence that quietly depends on the order it happened to iterate in — an accumulator that was never rescaled into the new baseline, say, which would produce the right shape, raise no exception, and be wrong by tens of percent. Worth noting when it would *not* catch it: on any input small enough to fit inside a single tile there is no second block to raise the maximum, so an order-dependent bug is invisible. So a test that only uses short inputs proves less than it appears to: it has to cross several key tiles, with the largest score arriving late. That condition is easy to state and easy to leave untested, so here it is as a case rather than an aspiration — three unremarkable keys, then a large one in the final tile:
+
+```{python}
+Q_late = torch.ones(1, 1)
+K_late = torch.tensor([[0.0], [0.0], [0.0], [20.0]])   # the max arrives last
+V_late = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+
+O_late, _ = flash_attention(Q_late, K_late, V_late, block_q=1, block_k=2)
+O_ref, _ = exact_attention(Q_late, K_late, V_late)
+torch.testing.assert_close(O_late.double(), O_ref)
+print(f"max in the final key tile: {O_late.item():.7f} vs {O_ref.item():.7f}  ✓")
+```
+
+The rescale is doing all the work here: the first tile accumulates against a baseline of 0, then the second raises it to 20, and every earlier contribution has to be pulled down by `e^-20` before it can be added to. The case is here to cover that branch deterministically, rather than hoping a random input happens to exercise it.
+
 **On what "exact" means.** FlashAttention is exact in the algorithmic sense: it targets the same dense attention function, with no approximation, sparsification or low-rank shortcut. It is *not* bit-identical — tiling reassociates the sums, and floating-point addition isn't associative, so the rounding differs. A fused GPU backend will differ again, which PyTorch says outright about its own backends.
 
-## Break it: drop the rescale
+## The forward pass is only half of it
 
-The rescale is one multiplication per block. It's easy to convince yourself it's a minor correction. Here is the same algorithm with the two `alpha` factors removed and nothing else changed:
+The implementation above never builds a `T×T` tensor, and the tests back that up. But that's a claim about the *forward* pass, and training needs the backward pass too.
 
-```{python}
-def flash_no_rescale(Q, K, V, block_q=32, block_k=32):
-    """Identical to flash_attention except for the two missing `alpha` factors.
-    One defect, isolated."""
-    Tq, d = Q.shape
-    Tk, dv = K.shape[0], V.shape[1]
-    scale = 1.0 / math.sqrt(d)
-    O = torch.zeros(Tq, dv)
+The saving doesn't carry over on its own. Ordinary autograd records tile-level intermediates across the whole loop, and their aggregate stays quadratic even though no single retained tensor is larger than one tile. **The tiled forward avoided *allocating* the score matrix; it did not avoid *remembering* it.**
 
-    for i in range(0, Tq, block_q):
-        n_q = min(block_q, Tq - i)
-        Qi = Q[i:i + n_q]
-        Oi = torch.zeros(n_q, dv)
-        mi = torch.full((n_q,), -torch.inf)
-        li = torch.zeros(n_q)
-        for j in range(0, Tk, block_k):
-            n_k = min(block_k, Tk - j)
-            Kj, Vj = K[j:j + n_k], V[j:j + n_k]
-            S = (Qi @ Kj.T) * scale
-            mi = torch.maximum(mi, S.max(dim=-1).values)
-            P = torch.exp(S - mi[:, None])
-            li = li + P.sum(dim=-1)          # ← no alpha
-            Oi = Oi + P @ Vj                 # ← no alpha
-        O[i:i + n_q] = Oi / li[:, None]
-    return O
+Which is why FlashAttention is two techniques rather than one. The second is a custom backward that keeps the required inputs, the output, and the row statistics `L` — the reason the function above bothers to return `L` — and reconstructs the score and probability tiles when the gradients need them. Extra arithmetic in exchange for avoiding quadratic HBM traffic is a trade that runs in your favour when traffic is what binds.
 
-torch.manual_seed(0)
-Q, K, V = (torch.randn(64, 32) for _ in range(3))
-wrong = flash_no_rescale(Q, K, V)
-right, _ = exact_attention(Q, K, V)
+[What ordinary autograd saves](02b-what-autograd-saves.qmd) measures all of this: what gets retained, how recomputation changes the scaling, and whether the gradients survive it.
 
-print(f"same output shape:  {wrong.shape == right.shape}")
-print(f"largest error:      {(wrong - right).abs().max():.4f}")
-print(f"relative error:     {(wrong - right).norm() / right.norm():.1%}")
-```
-
-Twenty-odd percent wrong, correct shape, no exception, and an output that looks entirely plausible — every row is still a genuine weighted average of value vectors, just with the wrong weights. Shipped inside a model, you would read this as slightly disappointing quality, not as a bug.
-
-The mechanism is worth stating because it explains *when* it hides. Whenever a later block raises the running maximum, the terms from earlier blocks were exponentiated against a smaller baseline and are therefore too large relative to everything after. Without `alpha` they keep that inflated weight permanently, so **the output is biased toward whichever keys happened to be processed first.**
-
-That's a claim worth testing rather than asserting. Attention is invariant to the order of the keys — permute the keys and values together and the output must not move. So if the broken version really is biased by processing order, reversing the keys should change its answer:
-
-```{python}
-reversed_order = torch.arange(K.shape[0] - 1, -1, -1)      # same pairs, opposite order
-Kr, Vr = K[reversed_order], V[reversed_order]
-
-dense_fwd, _ = exact_attention(Q, K, V)
-dense_rev, _ = exact_attention(Q, Kr, Vr)
-broken_fwd   = flash_no_rescale(Q, K, V)
-broken_rev   = flash_no_rescale(Q, Kr, Vr)
-
-print(f"correct attention, reversed vs original: "
-      f"{(dense_fwd - dense_rev).norm() / dense_fwd.norm():.1e}  (invariant, as it must be)")
-print(f"broken version,    reversed vs original: "
-      f"{(broken_fwd - broken_rev).norm() / broken_fwd.norm():.0%}  ← order changes the answer")
-```
-
-Correct attention doesn't move; the broken version moves by a third. **The missing rescale has turned a permutation-invariant function into one that depends on the order you happened to iterate in.**
-
-And it has a nasty corollary: if no later block ever raises the maximum, the omission costs exactly nothing. So the bug vanishes on inputs small enough to fit one tile, and on any input whose scores happen to peak early — which is precisely what you'd test first.
-
-## Causal masking: half the work disappears
+## Causal masking: half the score tiles disappear
 
 In the dense implementation, causal masking sets the upper triangle to `-inf`: you compute every score, then throw half of them away. Tiling changes the economics, because a key block entirely beyond the current query block can be **skipped without computing anything at all** — that's the `break` in the inner loop.
 
@@ -459,11 +439,13 @@ for T, block in [(1024, 128), (4096, 128)]:
     print(f"{T:>9} {block:>7} {computed:>8}/{total:<9} {1 - computed/total:>8.0%}")
 ```
 
-Roughly half the work vanishes, approaching exactly half as blocks get small relative to the sequence. Blocks straddling the diagonal still need element-level masking — those are the ones where `k_pos > q_pos` does real work — but they're a thin band, $O(n)$ blocks out of $O(n^2)$.
+Roughly half the score tiles vanish, approaching exactly half as blocks get small relative to the sequence. Blocks straddling the diagonal still need element-level masking — those are the ones where `k_pos > q_pos` does real work — but they're a thin band, $O(n)$ blocks out of $O(n^2)$.
+
+What that counts is score tiles, not end-to-end layer time. The projections, the reductions and the output work are unchanged, and how much of the tile saving reaches the clock depends on whether there is enough parallelism across batch, heads and query blocks to keep the machine busy while the triangular shape makes some workers finish early. Half the tiles is a real saving; it is not half the latency.
 
 ## Why it's faster: counting movement, not arithmetic
 
-Here's what surprises people: **FlashAttention does not save you any of the expensive multiplications, and is faster anyway.**
+Here's what surprises people: **for dense attention FlashAttention saves none of the expensive multiplications, and is faster anyway.** (Causal tiling is the exception noted above — a skipped tile skips its matmuls too.)
 
 Be precise about what it adds and doesn't. The two dominant matmuls — $QK^\top$ and $PV$ — are exactly the same work as before. On top of them the forward pass adds online-softmax bookkeeping: extra exponentials, the running reductions, the rescaling. And the backward pass deliberately *recomputes* score and probability tiles instead of reading stored ones.
 
@@ -477,12 +459,14 @@ The FlashAttention paper's analysis, for an on-chip working set of `M` elements,
 
 $$\Theta\!\left(\frac{T^2 d^2}{M}\right)$$
 
+The code below keeps the mandatory `Td` term for reading the inputs and writing the output; at finite `T` it isn't negligible, and the asymptotic statement suppresses it.
+
 The intuition for that form: you sweep the key blocks for every query block, and how many sweeps you need depends on how much fits on-chip at once — so `M` lands in the denominator. **The bigger the fast memory, the fewer times you re-read the slow one.**
 
 These are **counts of memory accesses under a model**, not timings — nothing below is a speed benchmark:
 
 ```{python}
-d, M = 64, 100_000                     # M: on-chip working set, in ELEMENTS not bytes
+d, M = 64, 48_000                      # M: on-chip working set, in ELEMENTS not bytes
 print(f"{'context':>9} {'standard':>12} {'tiled':>10} {'ratio':>8}")
 for T in [1024, 8192]:
     standard = T*T + T*d
@@ -492,7 +476,7 @@ for T in [1024, 8192]:
 
 Two qualifications, and the second one is easy to get backwards.
 
-**These are model figures, not hardware estimates.** `M` is slippery: on-chip memory is quoted in bytes, and the usable tile budget depends on dtype, shared memory versus registers, occupancy, and the fact that Q, K, V, the score tile, the accumulators and the row statistics must all fit simultaneously. A hundred thousand fp32 elements is about 400 KB; the same count in fp16 is 200 KB. The `Θ(T²d²/M)` result also assumes the regime typical of GPU tiling, where on-chip capacity isn't tiny relative to `d²`; later I/O-complexity work shows the optimum differs when `M < d²`.
+**These are model figures, not hardware estimates.** `M` is slippery: on-chip memory is quoted in bytes, and the usable tile budget depends on dtype, shared memory versus registers, occupancy, and the fact that Q, K, V, the score tile, the accumulators and the row statistics must all fit simultaneously. The `M = 48_000` below is about 188 KiB of fp32 slots, which lines up with the 192 KB per SM quoted earlier. It also keeps the illustration inside the regime the theorem is stated for, `d ≤ M ≤ Td`; a larger `M` breaches the upper bound at the shortest context in the table. The `Θ(T²d²/M)` result also assumes the regime typical of GPU tiling, where on-chip capacity isn't tiny relative to `d²`; later I/O-complexity work shows the optimum differs when `M < d²`.
 
 **The advantage does not grow without bound.** It's tempting to say it "grows with sequence length," and the arithmetic doesn't support that. Take the leading terms: `T²` divided by `T²d²/M` is `M/d²` — *independent of `T`*. What actually happens is that the ratio climbs toward that constant:
 
@@ -502,9 +486,9 @@ for T in [1024, 8192, 65536, 524288]:
     print(f"   T = {T:>7}: ratio {(T*T + T*d) / (T*T*d*d/M + T*d):>6.2f}")
 ```
 
-So the honest statement is that the I/O advantage **becomes relevant** at long contexts and saturates at a constant set by your hardware and head width — not that it improves indefinitely.
+So the honest statement is that the I/O advantage **becomes relevant** at long contexts and saturates at a constant set by your hardware and head width — not that it improves indefinitely. Within this counting model that constant is exactly `M/d²`; the underlying result is asymptotic, so read it as a proportionality rather than a number to quote.
 
-This post was written without a GPU, so it contains no speedup measurement at all. The mechanism is sound and the published benchmarks are substantial; for a figure on *your* shapes and hardware, use the harness from [the GPU cost model post](../../../fundamentals/tensors/05-how-the-gpu-runs-your-code.qmd) — warm up, synchronize, repeat, record the environment.
+This post was written without a GPU, so it contains no speedup measurement at all. The mechanism is sound and the published benchmarks are substantial; for a figure on *your* shapes and hardware, use the harness from [the GPU cost model post](../fundamentals/tensors/05-how-the-gpu-runs-your-code.qmd) — warm up, synchronize, repeat, record the environment.
 
 ## What it doesn't solve
 
@@ -512,7 +496,7 @@ Some scope, since "FlashAttention" gets used as shorthand for "attention is solv
 
 **It doesn't change the arithmetic asymptotics.** Attention is still `O(T²d)` multiplications. FlashAttention removes the `O(T²)` *memory*, which was the thing actually breaking, but compute still grows quadratically. Linear-attention variants attack the other axis and make different trade-offs.
 
-**It helps much less at decode time.** Generating one token at a time means one query against a cached history — there is no `T×T` matrix to avoid, so the quadratic saving isn't there. Decode is bound instead by reading the KV cache and finding enough parallelism, which is [the KV cache post's](../kv-cache/index.qmd) subject. A fused kernel still helps somewhat (fewer buffers, fewer launches), and **Flash-Decoding** adapts the same online-reduction identity by splitting the *key* axis across parallel workers and combining partial results — a nice demonstration that the identity, rather than the tiling schedule, is the reusable part.
+**It helps much less at decode time.** Generating one token at a time means one query against a cached history — there is no `T×T` matrix to avoid, so the quadratic saving isn't there. Decode is bound instead by reading the KV cache and finding enough parallelism, which is [the KV cache post's](01-kv-cache.qmd) subject. A fused kernel still helps somewhat (fewer buffers, fewer launches), and **Flash-Decoding** adapts the same online-reduction identity by splitting the *key* axis across parallel workers and combining partial results — a nice demonstration that the identity, rather than the tiling schedule, is the reusable part.
 
 **The kernel is hardware-specific, and it keeps moving.** Each generation retunes the same algorithm as the bottleneck shifts:
 
@@ -523,22 +507,36 @@ Some scope, since "FlashAttention" gets used as shorthand for "attention is solv
 | **FA3** | Hopper: asynchrony and low precision |
 | **FA4** | Blackwell, where matmul throughput scaled faster than shared-memory bandwidth and the exponential units — so the softmax itself became limiting |
 
-The FA4 case is a nice postscript to the break-it section above, because it revisits exactly the identity this post is built on. When the running maximum creeps up by a small amount, FA4 **doesn't move the baseline at all**: it keeps accumulating the new block against the old reference frame and defers the correction until the accumulated shift crosses a threshold, then does one larger rescale. The final normalization still uses the true statistics, so the answer is preserved at the intended precision.
+The FA4 case revisits exactly the identity this post is built on. When the running maximum creeps up by a small amount, FA4 **doesn't move the baseline at all**: it keeps accumulating the new block against the old reference frame and defers the correction until the accumulated shift crosses a threshold, then does one larger rescale. The final normalization still uses the true statistics, so the answer is preserved at the intended precision.
 
-Note the distinction from the broken version above, which is not subtle. Dropping the rescale *unconditionally* costs twenty-odd percent, permanently. Deferring it *while tracking that deferral* costs nothing and saves vector work. Same identity, read more carefully.
+The distinction is worth stating precisely, because it is easy to read FA4 as skipping the rescale. It doesn't. Dropping the correction outright would leave earlier blocks permanently over-weighted relative to later ones — the very failure the permutation test above is designed to catch. Deferring it *while tracking the deferral*, and settling up before it can cost precision, cuts vector work while holding the intended accuracy. Same identity, read more carefully.
 
 **And you probably shouldn't write this yourself.** `F.scaled_dot_product_attention` dispatches to a FlashAttention backend when device, dtype, shapes and mask allow. The reason to understand the algorithm is to know what you're getting, why the backend silently refuses in some configurations, and what changed when a result moved in the last decimal place after a version bump.
+
+::: {.callout-tip}
+## Five things that decide what your PyTorch call actually does
+
+**Dispatch is conditional and silent.** Device, dtype, head dimension, alignment, mask type and PyTorch version all participate, and falling back to the math backend costs you the memory saving without any warning. If you need to know, select the backend explicitly with `torch.nn.attention.sdpa_kernel` and let it raise rather than fall back.
+
+**Boolean masks keep where they are `True`.** The opposite of the `-inf` convention people carry over from hand-written attention, and getting it backwards produces a plausible-looking wrong answer rather than an error.
+
+**`need_weights=True` asks for the thing this post is about not building.** `nn.MultiheadAttention` returns a `T×T` weight tensor when you request it, which means materializing it — and the default is `True`. Pass `need_weights=False` unless you are inspecting attention maps.
+
+**Dropout is applied whether or not you meant it.** The functional form has no notion of training versus evaluation — whatever `dropout_p` you pass is what it applies. If that value is plumbed through from a config, pass `0.0` explicitly at evaluation time.
+
+**Padding is silent waste.** A fused kernel still does the work for padded positions if you pad every sequence to the longest in the batch. At mixed lengths, packing or a variable-length kernel matters more than the choice of attention implementation.
+:::
 
 ## What to carry away
 
 The score matrix is used once and thrown away, and softmax's need for whole-row statistics is what makes building it look unavoidable.
 
-- **A GPU has two memories.** On-chip SRAM is roughly 13× the bandwidth of HBM and roughly 1/2000th the capacity. At long context the score matrix cannot fit in the fast one, so it commutes to the slow one — and that traffic, not the arithmetic, is the cost.
+- **The memory hierarchy is the constraint.** In the two-level model used above, on-chip storage has roughly 13× the aggregate bandwidth of HBM at roughly one two-thousandth of the capacity. At long context the score matrix cannot fit in the fast one, so it commutes to the slow one, and at these shapes that traffic binds before the arithmetic does.
 - **Online softmax removes the barrier.** Keep a running maximum, denominator and unnormalized output; when a block raises the maximum, *replace* the maximum and *rescale* the other two by $e^{m_{\text{old}} - m_{\text{new}}}$. Applying that correction to the **output** is what turns a softmax trick into an attention algorithm.
 - **It is exact in the algorithmic sense** — verified above against a float64 reference across shapes, block sizes and causal settings — but not bit-identical, because tiling reassociates floating-point sums.
-- **Drop the rescale and the error runs to tens of percent**, with the right shape and no exception, biased toward whichever keys were processed first. And it hides completely on inputs small enough to fit one tile.
+- **A tiled forward pass is not memory-efficient training.** Ordinary autograd retains tile-level intermediates across the whole loop, and their aggregate stays quadratic even though no single retained tensor is larger than one tile. Beyond the `Q`, `K` and `V` it needs like any implementation, FlashAttention's custom backward saves the output and the row statistics rather than the quadratic tensors, reconstructing those on demand.
 - **Causal masking becomes a work saving**, not just a correctness constraint: whole blocks in the future are skipped rather than computed and discarded.
-- **The I/O advantage saturates** at `M/d²`, a constant set by your hardware and head width. It becomes relevant at long context; it does not improve forever.
+- **The I/O advantage saturates.** Within this access-counting model the ratio approaches `M/d²`, a constant set by on-chip capacity and head width. It becomes relevant at long context; it does not improve forever, and it is a traffic ratio rather than a speedup.
 - **It doesn't make attention linear**, and it isn't the answer to decode-time bandwidth limits.
 
 If one sentence survives: *you never needed the score matrix, only the average it produces — and once the softmax statistics can be revised as they go, the scores never have to be written down at all.*
