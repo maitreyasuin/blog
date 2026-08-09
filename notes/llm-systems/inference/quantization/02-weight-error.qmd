@@ -1,0 +1,604 @@
+---
+title: "The Weight Error Is Not the Error That Matters"
+description: "Two int4 quantizers, one with nearly twice the weight reconstruction error, and it is the better one by a factor of three. This post derives what a layer actually experiences, proves exactly when second-order compensation has something to do and when it has nothing, and shows GPTQ confidently correcting for correlations that a finite calibration set invented."
+categories: [quantization, numerics, llm-systems]
+date: 2026-08-09
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+[The previous post](01-one-outlier.qmd) treated quantization as a problem of fitting a grid to a tensor, and judged the result by how closely `Ŵ` reproduced `W`. While quantization error is small that is a serviceable sanity metric. Under aggressive 4-bit quantization its limitation becomes impossible to ignore, and the reason is almost embarrassingly obvious once stated: **the layer never uses `W` in isolation.** It uses it through `XWᵀ`. Weight error only matters through the activations it gets multiplied by.
+
+This post starts with a table that makes no sense under the old objective and follows it until it does.
+
+> **TL;DR** — Layer output error is `tr(EHEᵀ)` with `H = XᵀX`, so the cost of a weight error depends on the activation geometry it sits in. When `H` is diagonal that reduces to a weighted sum of independent squares and nearest-rounding is already optimal — GPTQ's compensation provably has nothing to do, and it reproduces round-to-nearest **exactly, bit for bit**. When `H` has off-diagonal structure, one rounding error can be traded against another and compensation earns 2–3×. The trap is that you never have `H` — you have an estimate of it, and a finite calibration set invents off-diagonal structure that isn't there. At `T/K = 1` the gain falls to **0.604×** — GPTQ's held-out error is 1.66× round-to-nearest's, for a method meant to improve on it. Damping is the dial that says how much to believe the geometry: turning it up progressively suppresses the compensation term, driving the method back toward round-to-nearest.
+
+```{python}
+import math
+import torch
+
+torch.set_num_threads(1)
+torch.manual_seed(0)
+print("torch", torch.__version__)
+```
+
+---
+
+# The table that makes no sense
+
+## Two quantizers
+
+Two ways to get a weight matrix into 4 bits. The first is round-to-nearest: pick a scale per output row, round, done. The second is a column-by-column scheme we'll build later. For now treat it as a black box.
+
+```{python}
+def symmetric_scale(W, bits, dim=-1):
+    """One scale per slice along `dim`, with the zero-range guard from part 1."""
+    n = 2 ** (bits - 1) - 1
+    max_abs = W.abs().amax(dim=dim, keepdim=True)
+    return torch.where(max_abs == 0, torch.ones_like(max_abs), max_abs / n)
+
+
+def rtn(W, bits=4, group=None):
+    """Round-to-nearest. One scale per output row, or per group along K."""
+    n = 2 ** (bits - 1) - 1
+    if group is None:
+        s = symmetric_scale(W, bits, dim=1)
+        return torch.clamp(torch.round(W / s), -n, n) * s
+    out = W.clone()
+    for g in range(0, W.shape[1], group):
+        blk = W[:, g:g + group]
+        s = symmetric_scale(blk, bits, dim=1)
+        out[:, g:g + group] = torch.clamp(torch.round(blk / s), -n, n) * s
+    return out
+
+
+def gptq(W, H, bits=4, gamma=0.01):
+    """Quantize column by column, pushing each rounding error into the
+    columns that have not been quantized yet. Derived properly below."""
+    N, K = W.shape
+    Wq = W.clone()
+    n = 2 ** (bits - 1) - 1
+    s = symmetric_scale(W, bits, dim=1).squeeze(1)         # grid fixed up front
+
+    Hd = H + torch.eye(K, device=H.device, dtype=H.dtype) * gamma * torch.diag(H).mean()
+    H_inv = torch.cholesky_inverse(torch.linalg.cholesky(Hd))
+    U = torch.linalg.cholesky(H_inv, upper=True)           # U.T @ U == H_inv
+
+    for j in range(K):
+        w = Wq[:, j].clone()
+        q = torch.clamp(torch.round(w / s), -n, n) * s
+        err = (w - q) / U[j, j]
+        Wq[:, j] = q
+        if j + 1 < K:
+            Wq[:, j + 1:] -= err[:, None] * U[j, j + 1:][None, :]
+    return Wq
+```
+
+Both use **the same grid**: one scale per output row, computed the same way. (Four bits gives 16 codewords; the symmetric convention here uses 15 of them, $[-7, 7]$, spending one code to keep the range even.) That matters — if one method used finer groups than the other, any difference could just be granularity — and we'll see later that changing granularity alone is worth 12–20% in these controls. Matched grids, so whatever we see is the algorithm.
+
+## The measurement
+
+Build a layer, a calibration set, and — separately — a held-out set drawn from the same distribution. Judge everything on the held-out set.
+
+```{python}
+K, N = 256, 128
+W = torch.randn(N, K) * 0.1
+
+gen = torch.Generator().manual_seed(3)
+spectrum = torch.exp(torch.randn(K, generator=gen) * 1.6)
+rotation, _ = torch.linalg.qr(torch.randn(K, K, generator=gen))
+A = rotation @ torch.diag(spectrum.sqrt())          # activation geometry
+
+def draw(n_tokens, seed):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(n_tokens, K, generator=g) @ A.T
+
+X_cal, X_eval = draw(8192, 1), draw(8192, 2)
+H = X_cal.T @ X_cal
+
+weight_mse = lambda Q: ((W - Q) ** 2).mean().item()
+output_mse = lambda Q, X: ((X @ (W - Q).T) ** 2).mean().item()
+
+print(f"{'quantizer':<12}{'weight MSE':>13}{'rank':>6}"
+      f"{'held-out output MSE':>22}{'rank':>6}")
+results = {"RTN": rtn(W, 4), "GPTQ": gptq(W, H, 4)}
+by_w = sorted(results, key=lambda k: weight_mse(results[k]))
+by_o = sorted(results, key=lambda k: output_mse(results[k], X_eval))
+for name, Q in results.items():
+    print(f"{name:<12}{weight_mse(Q):>13.4e}{by_w.index(name) + 1:>6}"
+          f"{output_mse(Q, X_eval):>22.4e}{by_o.index(name) + 1:>6}")
+```
+
+GPTQ reconstructs the weights considerably worse and the layer output considerably better. It is not a small effect in either direction, and the two rankings are exactly reversed.
+
+Either weight MSE is measuring the wrong thing, or the better-looking quantizer is worse. It is the first one.
+
+---
+
+# What the layer actually experiences
+
+## One line of algebra
+
+Let `E = W − Ŵ` be the weight error. The error the layer produces is the difference of the two outputs:
+
+$$Y - \hat Y = XW^\top - X\hat W^\top = XE^\top$$
+
+Take the squared Frobenius norm, and use `‖M‖²_F = tr(MMᵀ)`:
+
+$$\|XE^\top\|_F^2 = \operatorname{tr}\!\left(XE^\top E X^\top\right) = \operatorname{tr}\!\left(E\, X^\top X\, E^\top\right)$$
+
+The last step is the cyclic property of the trace, and it is the whole point, because it collects the activations into a single `K × K` object:
+
+$$\boxed{\;\|XE^\top\|_F^2 = \operatorname{tr}\!\left(E H E^\top\right), \qquad H = X^\top X\;}$$
+
+`H` is the activation Gram matrix; `H/T` is the empirical uncentred second moment, and it is a covariance only if the activations are centred. The overall factor of `T` cancels from every ratio below. (Strictly, the Hessian of this quadratic objective is $2X^\top X$; the factor of two cancels from every ratio below, so `H = XᵀX` is used throughout.) It is the geometry of how this layer's inputs are actually exercised. Verify the identity rather than trusting it:
+
+```{python}
+E = W - rtn(W, 4)
+direct = ((X_cal @ E.T) ** 2).sum().item()
+via_H = torch.trace(E @ H @ E.T).item()
+print(f"||XEᵀ||²_F  direct  {direct:.6e}")
+print(f"tr(E H Eᵀ)          {via_H:.6e}")
+print(f"relative difference {abs(direct - via_H) / direct:.2e}")
+```
+
+Now read the equation instead of implementing anything, because it tells you in advance when compensation can possibly help.
+
+## When there is nothing to compensate
+
+Suppose `H` is **diagonal** — the cross second-moments vanish, which for the centred activations used here means the input channels are uncorrelated. Then
+
+$$\operatorname{tr}(EHE^\top) = \sum_{n,k} H_{kk} E_{nk}^2$$
+
+Every term involves a single entry of `E`. There are no cross terms `H_{ij}E_iE_j`. So with the grid fixed, each weight can be optimized independently of every other weight, and multiplying a squared error by a positive constant `H_kk` does not change which grid point is nearest.
+
+**Round-to-nearest is already optimal.** Not approximately — exactly. There is no trade available, because there is nothing to trade against.
+
+This is a strong enough claim to be worth testing rather than asserting. Feed GPTQ the exact diagonal population `H`:
+
+```{python}
+diag_pop = torch.diag(spectrum) * 8192          # exactly diagonal, by construction
+Q_pop = gptq(W, diag_pop, 4)
+R = rtn(W, 4)
+
+print(f"GPTQ output identical to RTN : {torch.equal(Q_pop, R)}")
+print(f"max |GPTQ - RTN|             : {(Q_pop - R).abs().max():.3e}")
+```
+
+Bit for bit. And the mechanism is visible in the code: if `H` is diagonal then `H⁻¹` is diagonal, the Cholesky factor of a diagonal matrix is diagonal, so `U[j, j+1:]` is exactly zero and the update line never does anything. The algorithm degenerates into its own baseline.
+
+## When there is something to compensate
+
+Now the controlled version. Keep the eigenvalues, the rank, and the condition number **identical**, and change only the basis — rotate the geometry so the same anisotropy is no longer aligned with the coordinate axes.
+
+```{python}
+def rho_rms(M):
+    """RMS off-diagonal correlation: normalize to unit diagonal, then take the
+    root-mean-square of the off-diagonal entries."""
+    d = torch.sqrt(torch.diag(M))
+    R = M / d[:, None] / d[None, :]
+    k = M.shape[0]
+    off = R - torch.diag(torch.diag(R))
+    return ((off ** 2).sum() / (k * (k - 1))).sqrt().item()
+
+
+print(f"spectrum: condition number {(spectrum.max() / spectrum.min()):.0f}, "
+      f"rank {K} — identical in both rows below\n")
+print(f"{'basis':<26}{'rho_rms':>10}{'RTN':>12}{'GPTQ':>12}{'gain':>9}")
+for label, mat in [("axis-aligned  Σ = Λ", torch.diag(spectrum.sqrt())),
+                   ("rotated       Σ = QΛQᵀ", rotation @ torch.diag(spectrum.sqrt()))]:
+    d = lambda t, s: torch.randn(t, K, generator=torch.Generator().manual_seed(s)) @ mat.T
+    Xc, Xe = d(8192, 11), d(8192, 12)
+    Hc = Xc.T @ Xc
+    r = ((Xe @ (W - rtn(W, 4)).T) ** 2).mean().item()
+    g = ((Xe @ (W - gptq(W, Hc, 4)).T) ** 2).mean().item()
+    print(f"{label:<26}{rho_rms(Hc):>10.4f}{r:>12.3e}{g:>12.3e}{r / g:>8.2f}x")
+```
+
+Same spectrum, same conditioning, same anisotropy — both rows draw from the same underlying Gaussian sample, so the second Gram matrix is an orthogonal similarity transform of the first and their eigenvalues are identical. The only difference is whether that structure is aligned with the axes the quantizer rounds along.
+
+The axis-aligned case lands just under parity rather than exactly at it. Unlike the population-`H` test above, this one uses an *empirical* Gram matrix, so a little spurious coupling survives — the `rho_rms` column says how much. That residue is the subject of the next section. Rotating the same sample produces the large gain.
+
+So the thing GPTQ exploits is not that some input directions matter more than others — that's anisotropy, and it's present in both rows. It is that **errors in different coordinates can be traded against each other**, which requires off-diagonal structure. When you round column `j` down, you can nudge the not-yet-quantized columns that co-vary with it to partly cancel the effect on the output.
+
+Throughout the rest of this post, one definition, never varied:
+
+$$\text{gain} = \frac{\text{held-out output MSE of RTN on the same grid}}{\text{held-out output MSE of the method}}$$
+
+Above 1 is better than round-to-nearest; below 1 is worse.
+
+---
+
+# The geometry you have is not the geometry there is
+
+## Compensating for correlations that don't exist
+
+A subtler failure appears once `H` is estimated rather than known. You never have `H`. You have `X_cal^T X_cal` for a calibration set of some finite size, and a finite sample of uncorrelated channels does not produce a diagonal matrix — it produces a diagonal matrix plus noise.
+
+That noise looks exactly like structure. And GPTQ will act on it.
+
+```{python}
+diag_A = torch.diag(spectrum.sqrt())            # population geometry: diagonal
+draw_d = lambda t, s: torch.randn(t, K, generator=torch.Generator().manual_seed(s)) @ diag_A.T
+X_test = draw_d(8192, 99)
+rtn_ref = ((X_test @ (W - rtn(W, 4)).T) ** 2).mean().item()
+
+print("true channel correlation is exactly zero; H is estimated from T_cal tokens\n")
+print(f"{'T_cal':>8}{'T/K':>7}{'rho_rms':>10}{'1/sqrt(T)':>12}{'gain':>9}")
+for T_cal in [256, 1024, 8192, 65536]:
+    Hc = (lambda X: X.T @ X)(draw_d(T_cal, T_cal))
+    g = ((X_test @ (W - gptq(W, Hc, 4)).T) ** 2).mean().item()
+    print(f"{T_cal:>8}{T_cal / K:>7.1f}{rho_rms(Hc):>10.4f}"
+          f"{1 / math.sqrt(T_cal):>12.4f}{rtn_ref / g:>8.3f}x")
+```
+
+Two things in that table, and both are worth sitting with.
+
+**The phantom correlation follows `1/√T_cal` almost exactly.** Compare the third and fourth columns — they agree to three decimal places at every calibration size. That is the sampling-noise scale you would expect for a correlation estimated from independent Gaussian channels, and in this control it holds tightly. Real activations are neither independent nor Gaussian, so treat it as the right order of magnitude rather than a law, but the direction is reliable: halving your calibration set does not halve the phantom structure, it multiplies it by √2.
+
+**GPTQ acts on it, and loses.** At `T/K = 1` the gain is **0.604×**. Read that back through the definition: gain is RTN's error over the method's, so 0.604× means GPTQ's held-out MSE is `1/0.604 = 1.66×` RTN's — two thirds again as much error as simply rounding. It is not failing to help; it is confidently applying corrections computed from correlations that do not exist. As the estimate improves, the damage recedes, and by `T/K = 256` it converges back to parity, which is where the algebra said it belonged all along.
+
+**Second-order information is only as good as the geometry it describes.** That sentence is the whole reason the next section exists.
+
+## Damping is a statement about trust
+
+GPTQ adds a small diagonal dampening term before the Cholesky-based inverse — the original paper uses 1% of the average diagonal:
+
+$$H_\gamma = H + \gamma \cdot \operatorname{mean}\!\left(\operatorname{diag} H\right) \cdot I$$
+
+The multiplier is relative to the average diagonal, which is what makes `γ = 0.01` portable across layers with wildly different activation scales. It is usually explained as numerical hygiene — `H` is singular when `T_cal < K`, and you cannot Cholesky a singular matrix.
+
+That's true but it undersells it. Watch what damping actually does to the algorithm:
+
+```{python}
+H_poor = (lambda X: X.T @ X)(draw_d(256, 7))       # T/K = 1, badly estimated
+R = rtn(W, 4)
+
+print(f"{'gamma':>9}{'max |GPTQ - RTN|':>20}{'gain':>9}")
+for gamma in [0.01, 0.1, 0.5, 2.0, 10.0, 100.0]:
+    Q = gptq(W, H_poor, 4, gamma)
+    g = ((X_test @ (W - Q).T) ** 2).mean().item()
+    print(f"{gamma:>9}{(Q - R).abs().max():>20.3e}{rtn_ref / g:>8.3f}x")
+```
+
+As `γ` grows the diagonal dampening term comes to dominate `H_γ`, its inverse becomes proportionally diagonal, the off-diagonal entries of `U` shrink toward zero, and the compensation term is progressively suppressed. **Damping continuously suppresses the compensation term, and in the large-`γ` limit GPTQ approaches round-to-nearest.** (The parameter and the coefficients vary continuously; the quantized weights do not, because rounding sits in between.) By `γ = 100` the held-out error is at RTN parity to three decimals — though note the middle column: the quantized matrices are still not identical, and only in the `γ → ∞` limit does the compensation term actually vanish. You have paid for a Cholesky factorization to arrive back where rounding started.
+
+Which makes the hyperparameter interpretable rather than arbitrary:
+
+> **Damping says how much of the estimated activation geometry you are willing to believe.**
+
+In this control, when estimation noise dominates, stronger damping helps; as the empirical geometry becomes more reliable, too much damping starts discarding coupling that is genuinely there. And now the crossover is predictable rather than a table to tune blindly. Note the discipline in this cell — `γ` is chosen on a *validation* split, and the number reported is on data neither the Hessian nor the hyperparameter ever saw:
+
+```{python}
+X_train, X_val = draw_d(512, 21), draw_d(512, 22)
+H_small = X_train.T @ X_train
+
+val = lambda gm: ((X_val @ (W - gptq(W, H_small, 4, gm)).T) ** 2).mean().item()
+gamma_star = min([0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0], key=val)
+
+held = ((X_test @ (W - gptq(W, H_small, 4, gamma_star)).T) ** 2).mean().item()
+print(f"gamma* = {gamma_star} chosen on validation")
+print(f"held-out gain at gamma*      : {rtn_ref / held:.3f}x")
+print(f"held-out gain at gamma = 0.01: "
+      f"{rtn_ref / ((X_test @ (W - gptq(W, H_small, 4, 0.01)).T) ** 2).mean().item():.3f}x")
+```
+
+Note what "best" means on this geometry. The population `H` here is diagonal, so parity with round-to-nearest is the *ceiling* — there is no real coupling to exploit and the algebra says GPTQ cannot win. Validation-selected damping gets to 0.987×, almost all the way back to that ceiling, while the default 0.01 sits at 0.804×. Damping isn't buying performance here; it is preventing a loss.
+
+## The quantizer can overfit too
+
+There is no gradient descent anywhere in GPTQ. There is no training loop, no learning rate, no epochs. And in this experiment it still overfits its calibration set, for exactly the reason above — it estimates something from finite data and then acts as if the estimate were the truth.
+
+The consequence for anyone benchmarking a quantizer is direct, and it is easy to get wrong by accident:
+
+```{python}
+X_h = draw(8192, 42)                    # held out, rotated (real coupling) geometry
+r_held = ((X_h @ (W - rtn(W, 4)).T) ** 2).mean().item()
+
+print(f"{'T_cal':>7}{'T/K':>6}{'gain on calibration':>22}{'gain held out':>16}{'flattery':>11}")
+for T_cal in [256, 512, 2048, 8192]:
+    X_c = draw(T_cal, 40 + T_cal)
+    Q = gptq(W, X_c.T @ X_c, 4)
+    r_cal = ((X_c @ (W - rtn(W, 4)).T) ** 2).mean().item()
+    on_cal = ((X_c @ (W - Q).T) ** 2).mean().item()
+    on_held = ((X_h @ (W - Q).T) ** 2).mean().item()
+    print(f"{T_cal:>7}{T_cal / K:>6.1f}{r_cal / on_cal:>21.2f}x{r_held / on_held:>15.2f}x"
+          f"{(r_cal / on_cal) / (r_held / on_held):>10.2f}x")
+```
+
+The last column is the size of the flattery, and it shrinks as the calibration set grows. With a small calibration set, the number you would have reported is substantially better than the number you would have got. Measure a calibration-aware method on its own calibration activations and you are measuring how well it reconstructed a specific sample's geometry, not whether it will generalize. Round-to-nearest is immune, because it never looked at the data at all — which makes it a deceptively weak-looking baseline if you evaluate the other method on its own calibration set.
+
+> **No training does not mean no data.**
+
+And once data is in the objective, the quantizer is a function of the data you showed it:
+
+```{python}
+gen2 = torch.Generator().manual_seed(9)
+rot2, _ = torch.linalg.qr(torch.randn(K, K, generator=gen2))
+B = rot2 @ torch.diag(spectrum.sqrt())              # a different geometry
+draw_B = lambda t, s: torch.randn(t, K, generator=torch.Generator().manual_seed(s)) @ B.T
+
+QA = gptq(W, draw(4096, 51).T @ draw(4096, 51), 4)
+QB = gptq(W, draw_B(4096, 52).T @ draw_B(4096, 52), 4)
+XA_h, XB_h = draw(8192, 61), draw_B(8192, 62)
+
+print(f"{'':<20}{'eval on A':>16}{'eval on B':>16}")
+for label, Q in [("calibrated on A", QA), ("calibrated on B", QB)]:
+    print(f"{label:<20}{((XA_h @ (W - Q).T) ** 2).mean():>16.4e}"
+          f"{((XB_h @ (W - Q).T) ** 2).mean():>16.4e}")
+```
+
+Cleanly diagonal, on held-out data from both distributions. If your calibration corpus does not look like your deployment traffic, the quantizer is optimized for the wrong geometry.
+
+---
+
+# Building the compensation
+
+Now that `H⁻¹` has a reason to exist, the algorithm is short.
+
+Quantize column `j`. That produces an error `e_j = w_j − q_j` in one coordinate. Under the old objective you would accept it and move on. Under `tr(EHEᵀ)` you don't have to, because the columns you *haven't* quantized yet are still free variables — and if they co-vary with column `j`, moving them can cancel part of the damage in the output.
+
+The optimal adjustment, for the quadratic objective with the grid fixed, distributes the error across the remaining columns in proportion to the inverse Hessian's row:
+
+$$\Delta w_{F \setminus j} = -\frac{e_j}{[H_F^{-1}]_{jj}} \cdot [H_F^{-1}]_{j,\, F \setminus j}$$
+
+where $F$ is the set of coordinates still free — not yet committed to the grid.
+
+That subscript is the part most write-ups drop, and it changes what the code has to compute. Once column `j` is committed to the grid it stops being a variable, `F` shrinks, and the relevant inverse is a *different matrix* at every step. The predecessor method, OBQ, updates that reduced inverse explicitly each time, which is exactly why it is expensive.
+
+GPTQ's reformulation is the observation that for a *fixed* column order, the normalized compensation coefficients that sequence requires can be encoded in a single factorization. Take the Cholesky factor of the damped inverse:
+
+$$U^\top U = H_\gamma^{-1}, \qquad U \text{ upper triangular}$$
+
+The normalized tail of row `j` — `U[j, j+1:] / U[j, j]` — then carries exactly the compensation coefficients step `j` needs. That is a checkable claim rather than a slogan:
+
+```{python}
+K_demo = 8
+M = torch.randn(K_demo, K_demo)
+H_demo = M @ M.T + torch.eye(K_demo) * 2.0
+U_demo = torch.linalg.cholesky(
+    torch.cholesky_inverse(torch.linalg.cholesky(H_demo)), upper=True)
+dense_inv = torch.linalg.inv(H_demo)
+
+print(f"{'step j':>7}{'U row vs reduced inverse':>28}{'U row vs dense inverse':>26}")
+for j in range(0, K_demo - 1, 2):
+    free = list(range(j, K_demo))
+    HF_inv = torch.linalg.inv(H_demo[free][:, free])      # inverse of the FREE set only
+    reduced = HF_inv[0, 1:] / HF_inv[0, 0]
+    dense = dense_inv[j, j + 1:] / dense_inv[j, j]
+    chol = U_demo[j, j + 1:] / U_demo[j, j]
+    print(f"{j:>7}{(reduced - chol).abs().max():>28.2e}"
+          f"{(dense - chol).abs().max():>26.2e}")
+```
+
+The middle column is zero to machine precision: **the normalized Cholesky row matches the normalized row of the reduced inverse.** The right column does not — past the first step, indexing the dense `H⁻¹` gives materially different numbers, because it still believes every coordinate is free. So the factorization is not a numerical convenience bolted onto the same formula. It is what makes the correct, order-dependent formula computable in a single pass.
+
+Which is why the loop reads:
+
+```python
+err = (w - q) / U[j, j]
+Wq[:, j + 1:] -= err[:, None] * U[j, j + 1:][None, :]
+```
+
+The individual entries of `U` do not carry a tidy meaning on their own; the quantity that does is the ratio `U[j, j+1:] / U[j, j]`, which is the compensation coefficient for each still-free coordinate.
+
+And if `H` is diagonal, `H⁻¹` is diagonal, the Cholesky factor of a diagonal matrix is diagonal, `U[j, j+1:]` is exactly zero, and nothing moves — the earlier result arriving by a second route.
+
+```{python}
+Q_gptq = gptq(W, H, 4)
+print(f"weight error grew   : {weight_mse(rtn(W, 4)):.4e} -> {weight_mse(Q_gptq):.4e}"
+      f"   ({weight_mse(Q_gptq) / weight_mse(rtn(W, 4)):.1f}x worse)")
+print(f"held-out output MSE : {output_mse(rtn(W, 4), X_eval):.4e} -> "
+      f"{output_mse(Q_gptq, X_eval):.4e}"
+      f"   ({output_mse(rtn(W, 4), X_eval) / output_mse(Q_gptq, X_eval):.2f}x better)")
+```
+
+That is the opening table, now with a mechanism: the algorithm *deliberately spends* weight-reconstruction accuracy, moving weights away from their nearest grid points, to buy output accuracy.
+
+::: {.callout-note}
+## What this implementation is not
+
+This is the algorithmic core, isolated so the equation is visible, and it already uses GPTQ's Cholesky form. What a production implementation adds on top: lazy batched updates so it isn't `K` separate rank-1 operations, column ordering heuristics, group-wise grids, weight packing, and the kernels needed to execute the packed format. This code explains why an inverse Hessian appears at all; it is not a drop-in replacement for a maintained implementation.
+:::
+
+---
+
+# A different structure, a different method
+
+## Scaling instead of compensating
+
+GPTQ exploits coupling. There is a second kind of structure entirely, and it needs a different tool.
+
+Recall the identity from the previous post: for diagonal `D` over the input channels, `XWᵀ = (XD⁻¹)(WD)ᵀ` exactly. There it was used to move activation outliers into the weights. The same algebra can be used for a different purpose: scale *up* the weight channels that matter most, so they land on a finer part of the grid relative to their neighbours, and scale the activations down to compensate.
+
+Which channels matter? The ones the activations actually use. Search a single exponent over the activation magnitudes — and select it **on the calibration set only**:
+
+```{python}
+def awq_scale(act_stat, alpha):
+    """Per-input-channel scale from activation magnitude, normalized to mean 1."""
+    s = act_stat.pow(alpha) if alpha > 0 else torch.ones_like(act_stat)
+    return s / s.mean()
+
+
+het = torch.ones(K)
+het[:8] = 12.0                                   # eight channels with large activations
+A_het = torch.diag(het) @ A
+draw_h = lambda t, s: torch.randn(t, K, generator=torch.Generator().manual_seed(s)) @ A_het.T
+Xc_h, Xe_h = draw_h(8192, 71), draw_h(8192, 72)
+act_stat = Xc_h.abs().mean(dim=0)
+
+err_h = lambda Q, X, s=None: (((X if s is None else X / s)
+                              @ (W * (1 if s is None else s) - Q).T) ** 2).mean().item()
+base_cal = err_h(rtn(W, 4), Xc_h)
+
+print(f"{'alpha':>7}{'calibration':>15}{'held-out':>14}")
+rows = []
+for alpha in [0.0, 0.1, 0.25, 0.4, 0.5, 0.75, 1.0]:
+    s = awq_scale(act_stat, alpha)
+    Wq = rtn(W * s, 4)
+    ec = (((Xc_h / s) @ (W * s - Wq).T) ** 2).mean().item()
+    ee = (((Xe_h / s) @ (W * s - Wq).T) ** 2).mean().item()
+    rows.append((ec, alpha, ee))
+    print(f"{alpha:>7}{ec:>15.4e}{ee:>14.4e}")
+
+_, alpha_star, held = min(rows)
+print(f"\nalpha* = {alpha_star} selected on calibration")
+print(f"held-out gain vs RTN: {err_h(rtn(W, 4), Xe_h) / held:.2f}x")
+```
+
+The curve has a minimum in the middle, and the mechanism is worth stating because it explains why more scaling is not better. Scaling a salient channel up gives its weights more effective resolution — but the row's scale is set by its largest entry, so inflating one channel widens the step for every other channel in that row. You are not removing quantization error; you are **moving** it. Past the optimum you have simply created a new range problem in the weights, which is the previous post's outlier story arriving from the other direction.
+
+> **Equivalent in floating point does not mean equivalent after quantization.**
+
+## Which channels are worth protecting
+
+A cleaner way to test whether the useful saliency signal lives in the activations rather than the weights: pick a small fraction of input channels, keep them in full precision, quantize the rest, and vary how you choose them.
+
+The honest way to test "no better than random" is to run random many times and look at where the alternatives fall in that distribution:
+
+```{python}
+def protect(indices):
+    Q = rtn(W, 4).clone()
+    Q[:, indices] = W[:, indices]
+    return ((Xe_h @ (W - Q).T) ** 2).mean().item()
+
+
+w_mag = W.abs().mean(dim=0)
+for pct in [0.01, 0.05]:
+    k = max(1, int(K * pct))
+    rand = torch.tensor([
+        protect(torch.randperm(K, generator=torch.Generator().manual_seed(s))[:k])
+        for s in range(100)])
+    lo, hi = rand.quantile(0.025).item(), rand.quantile(0.975).item()
+    by_act = protect(torch.topk(act_stat, k).indices)
+    by_w = protect(torch.topk(w_mag, k).indices)
+    print(f"protecting {pct:.0%} of input channels ({k} of {K})")
+    print(f"  random (100 draws)  mean {rand.mean():.4e}   95% [{lo:.4e}, {hi:.4e}]")
+    print(f"  by weight magnitude      {by_w:.4e}   "
+          f"{'inside' if lo <= by_w <= hi else 'OUTSIDE'} the random range")
+    print(f"  by activation magnitude  {by_act:.4e}   "
+          f"{'inside' if lo <= by_act <= hi else 'OUTSIDE'} the random range\n")
+```
+
+In this setup, weight magnitude lands inside the range you get by choosing at random; activation magnitude lands outside it. Whichever channels matter here, the weights alone do not identify them.
+
+::: {.callout-tip}
+## Protecting 1% does not mean storing 1% in fp16
+
+The mixed-precision version above is a *diagnostic*, not the method. Keeping a scattered 1% of channels at higher precision means irregular memory access and a kernel that has to handle two formats, which is considerably less hardware-friendly. AWQ's actual mechanism is the equivalent scaling in the previous cell: every weight stays in the same low-bit format, and the salient channels are protected by where they sit on the grid rather than by being exempted from it.
+:::
+
+## Two structures, isolated
+
+Both methods are now on the table, and there is a clean experiment for what each one needs. Construct the activation geometry as
+
+$$\Sigma = D R D$$
+
+where `R` is a correlation matrix with unit diagonal — pure coupling — and `D` is a diagonal of per-channel scales — pure heterogeneity. The two factors move independently, so you can switch each on and off.
+
+```{python}
+gen3 = torch.Generator().manual_seed(3)
+B = torch.randn(K, 48, generator=gen3) / 48 ** 0.5
+raw = B @ B.T + 0.35 * torch.eye(K)
+dg = torch.sqrt(torch.diag(raw))
+R_corr = raw / dg[:, None] / dg[None, :]            # unit diagonal: pure correlation
+D_het = torch.diag(het)                             # pure per-channel scale spread
+
+print(f"{'coupling R':>11}{'spread D':>10}{'RTN MSE':>12}{'RTN g128':>10}"
+      f"{'GPTQ':>9}{'AWQ':>9}")
+for coupled in [False, True]:
+    for hetero in [False, True]:
+        Rm = R_corr if coupled else torch.eye(K)
+        Dm = D_het if hetero else torch.eye(K)
+        L = torch.linalg.cholesky(Dm @ Rm @ Dm)
+        d = lambda t, s: torch.randn(t, K, generator=torch.Generator().manual_seed(s)) @ L.T
+        Xc, Xe = d(8192, 1), d(8192, 2)
+        Hc, a_stat = Xc.T @ Xc, Xc.abs().mean(dim=0)
+
+        base = ((Xe @ (W - rtn(W, 4)).T) ** 2).mean().item()
+        g128 = ((Xe @ (W - rtn(W, 4, 128)).T) ** 2).mean().item()
+        gq = ((Xe @ (W - gptq(W, Hc, 4)).T) ** 2).mean().item()
+
+        # pick the AWQ exponent on calibration, then use it once on held-out
+        best_cal, s_star = float("inf"), None
+        for al in [0.0, 0.1, 0.25, 0.4, 0.5, 0.75]:
+            s = awq_scale(a_stat, al)
+            e = (((Xc / s) @ (W * s - rtn(W * s, 4)).T) ** 2).mean().item()
+            if e < best_cal:
+                best_cal, s_star = e, s
+        aw = (((Xe / s_star) @ (W * s_star - rtn(W * s_star, 4)).T) ** 2).mean().item()
+        print(f"{str(coupled):>11}{str(hetero):>10}{base:>12.3e}{base / g128:>9.2f}x"
+              f"{base / gq:>8.2f}x{base / aw:>8.2f}x")
+```
+
+Read the last two columns down. With neither structure present, both methods sit at parity — there is nothing in the data for either of them to use, and the extra machinery buys nothing. With only scale spread, the scaling method earns its keep and the compensation method does not. With only coupling, the reverse. With both, both help and compensation helps more.
+
+**In this controlled model**, off-diagonal coupling creates the opportunity that GPTQ-style compensation exploits, and channelwise scale heterogeneity creates the opportunity that AWQ-style scaling exploits. That is a statement about the simplified cores under a stated objective, not about the full methods — the production versions carry grouping, clipping and search choices that this experiment does not model. But the direction is clear enough to be useful when you are deciding what to reach for.
+
+And notice the `RTN g128` column, steady at 1.12–1.20× across all four settings. Group-wise scaling requires no calibration data, no Hessian and no search, and in each of these controlled regimes it improves on per-row RTN before any calibration-aware method enters. **Check granularity before attributing a gain to a more sophisticated quantizer** — if a method is compared against a per-row baseline while itself using groups, some of its reported advantage is the group size.
+
+---
+
+# What it costs
+
+## "4-bit" is not four bits per parameter
+
+Group-wise scaling is not free, and the accounting is worth doing once because vendor claims rarely do it. Each group of `g` weights carries its own scale, and depending on the format a zero-point, and those are stored at higher precision:
+
+$$b_{\text{eff}} = b_{\text{weight}} + \frac{b_{\text{scale}} + b_{\text{zero}}}{g} + b_{\text{packing}}$$
+
+Two layouts, so the difference is visible. The first matches the symmetric quantizer used throughout these posts — one 16-bit scale per group and no zero-point. The second is the affine layout, which also stores a 16-bit zero-point (an integer code, not a float):
+
+```{python}
+K_width = 256                       # the layers in this post are 256 wide
+
+print(f"{'group':>8}{'symmetric':>12}{'affine':>10}   note")
+for g in [32, 64, 128, 256]:
+    note = "one group per row at this width" if g == K_width else ""
+    print(f"{g:>8}{4 + 16 / g:>12.3f}{4 + 32 / g:>10.3f}   {note}")
+
+sym = lambda g: 4 + 16 / g
+print(f"\ng=32 vs g=128, symmetric layout : {sym(32) / sym(128) - 1:.1%} more storage")
+print(f"overhead of g=128 over raw 4-bit: {sym(128) - 4:.3f} bits/weight")
+```
+
+Note the last row: with `K = 256`, a group size of 256 *is* per-row quantization, so there is no separate "free" per-row entry — a per-row scheme still stores one scale per row. Packing metadata and alignment padding add more in real formats, and some use 8-bit scales rather than 16. Compute it for your layout rather than quoting anyone's table.
+
+The point stands regardless: **"4-bit" describes the payload values, not the storage cost per parameter.** And when you compare a `g=32` scheme against `g=128` on accuracy alone, you are comparing at unequal memory — modestly so under the symmetric layout, more under the affine one.
+
+## An evaluation ladder
+
+Everything in this post is layer-level reconstruction on synthetic activations. That is the right resolution for understanding a mechanism and the wrong resolution for deciding what to ship. In order:
+
+1. **Quantizer sanity** — round-trip an exactly representable tensor and get it back.
+2. **Weight reconstruction error** — genuinely useful, for debugging. Wrong clipping, wrong axis, a broadcasting bug in the scale shape all show up here immediately. Never report it *alone*.
+3. **Layer output error on held-out activations** — the subject of this post, and the first metric that knows what the model does.
+4. **End-to-end model metric** — perplexity, task accuracy. Layer-level error can move without this moving, and occasionally the reverse.
+5. **Actual memory footprint** — measured, with the group overhead above included.
+6. **Latency and throughput, if a kernel exists.**
+
+That last one is a real caveat, not a formality. A quantization scheme that halves checkpoint size and reduces memory traffic can be a complete win at step 5 and offer nothing at step 6, because **a good quantizer is not automatically a fast inference format**. Whether it goes faster depends on whether a kernel can consume the packed representation efficiently, and that constraint can decide whether an accurate quantizer matters in practice at all.
+
+## What to carry away
+
+- **The layer never uses `W` in isolation.** Output error is `tr(EHEᵀ)` with `H = XᵀX`, so a weight error costs whatever the activation geometry says it costs.
+- **Diagonal `H` means nothing to compensate.** The objective separates into independent squares, nearest-rounding is already optimal, and GPTQ reproduces it exactly — verified bit for bit against the population Hessian.
+- **Coupling is what compensation needs**, not anisotropy. Holding the spectrum, rank and condition number fixed and only rotating the basis moves GPTQ from parity to a real gain.
+- **A finite calibration set invents coupling that isn't there.** In the independent-Gaussian control the RMS phantom correlation tracks `1/√T_cal`, and at `T/K = 1` acting on it drove the gain to 0.604× — 1.66× the error of plain rounding.
+- **Damping is a trust dial, not just conditioning.** As `γ` grows, `H_γ → γI`, compensation vanishes, and GPTQ walks continuously back to round-to-nearest.
+- **Calibration-aware quantizers can overfit without any training.** Evaluate on held-out activations or you are measuring how well a method reconstructed one sample's geometry.
+- **Weight magnitude did not identify the important channels here** — it landed inside the 100-draw random-selection range, while activation magnitude landed outside it.
+- **Check granularity before crediting an algorithm.** Group-wise scaling gave 1.12–1.20× in all four controlled settings, with no calibration data and no search, at a storage cost of 0.125 bits per weight under the symmetric layout.
+
+If one sentence survives: *a quantizer can only exploit structure that is actually present in the activations, and it will cheerfully exploit structure that is only present in your calibration sample.*
+
+## References
+
+- Frantar et al., [*GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers*](https://arxiv.org/abs/2210.17323), 2023 — the layer-output objective, second-order compensation, damping and the Cholesky reformulation.
+- Lin et al., [*AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration*](https://arxiv.org/abs/2306.00978), 2024 — salient channels identified from activation statistics, protected by equivalent scaling rather than mixed precision.
+- [*One outlier sets everyone's precision*](01-one-outlier.qmd) — the grid, the axes, and where activation outliers live.
