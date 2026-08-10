@@ -1,0 +1,540 @@
+---
+title: "Speculative Decoding: Exact Sampling Is Only Half the Problem"
+description: "A small model proposes, a big model verifies, and the samples are provably from the big model's distribution. That is the easy half. This post derives the acceptance rule from scratch, shows how correct sampling mathematics can still be defeated by indexing and state inconsistencies, and ends with the region where the algorithm is exact and slower than not using it."
+categories: [llm-systems, inference, sampling]
+date: 2026-08-10
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+Decoding is serial for a reason that no amount of engineering removes. To sample $x_t$ you need $p(\cdot \mid x_{<t})$, and to have that you need $x_{t-1}$. The KV cache from [an earlier post](../kv-cache/index.qmd) removed the repeated attention work; it did not remove the dependency. One forward pass, one token.
+
+Speculative decoding is the observation that this is only true for tokens you don't already have. If somebody *hands* you four candidate tokens, a transformer can score all four positions in a single pass, because teacher forcing evaluates every position at once. **Verification exposes parallelism that generation does not.**
+
+Everything else follows from asking two questions, and they are more separable than they look. How do you turn "the big model scored these candidates" into samples that are provably from the big model's distribution? And when is doing so actually faster? The first has an exact answer that holds no matter how bad the draft is. The second is where the draft's quality actually matters.
+
+> **TL;DR** — Three layers, and it is worth not conflating them. **Exactness** comes from the modified rejection rule alone, and it holds for *any* proposal distribution — a badly wrong drafter still samples exactly from the target, it just accepts rarely. **Statistical efficiency** is $\beta(h) = 1 - \mathrm{TV}(p, q)$, the mass the two distributions share at a given prefix. **Systems efficiency** is whether block verification is cheap enough to be worth it. In between sit failures that leave the mathematics intact and the decoder wrong: a one-position logit misalignment (**TV 0.90** against the true sequence distribution), and acceptance ratios computed with a distribution other than the one that produced the proposal (**TV 0.28**). Plus an accounting error that makes everyone overestimate the payoff — at $\alpha = 0.8$, $k = 8$ the block retires 4.33 tokens, not the 6.4 that $k\alpha$ suggests. And a region where the algorithm is provably exact and slower than ordinary decoding.
+
+Everything runs on CPU. The end-to-end Monte Carlo test in Act II is the slow cell; the rest is instant.
+
+```{python}
+import math
+import itertools
+import torch
+
+torch.set_num_threads(1)
+torch.manual_seed(0)
+print("torch", torch.__version__)
+```
+
+---
+
+# Act I — getting the distribution right
+
+## The tempting algorithm
+
+Here is the thing almost everyone writes first. The draft proposes a token, the target scores it, and you keep it if it "looks reasonable" under the target.
+
+The whole difficulty is in that phrase. If you keep proposals that the target also finds likely, you are oversampling the tokens both models like, and undersampling the ones only the target likes. The result is fluent and wrong.
+
+So rather than guess, derive it. Take a five-token vocabulary, a target `p`, a draft `q`, and ask what acceptance rule makes the output exactly `p`.
+
+```{python}
+V = 5
+p = torch.softmax(torch.randn(V) * 1.4, dim=0)
+q = torch.softmax(torch.randn(V) * 1.4, dim=0)
+
+print(f"{'token':>6} {'p':>8} {'q':>8} {'min(p,q)':>10}")
+for i in range(V):
+    print(f"{i:>6} {p[i]:>8.4f} {q[i]:>8.4f} {min(p[i], q[i]):>10.4f}")
+print(f"\nshared mass = {torch.minimum(p, q).sum():.4f}")
+```
+
+Sample $x \sim q$ and accept with probability $\min\!\big(1, p(x)/q(x)\big)$. Why that expression: if the target wants token $x$ *more* than the draft does, the draft under-produces it and every proposal should be kept. If the target wants it *less*, the draft over-produces it, and you keep a fraction $p(x)/q(x)$ of the time — exactly enough to bring the rate back down.
+
+The mass that survives for token $x$ is then
+
+$$q(x) \cdot \min\!\left(1, \frac{p(x)}{q(x)}\right) = \min\big(p(x), q(x)\big)$$
+
+which is the last column of that table. That is the overlap, and it is the *only* part of `p` this procedure can produce directly.
+
+## What rejection has to sample from
+
+Accepted proposals have already delivered $\min(p, q)$. So the target mass still owed is
+
+$$p(x) - \min\big(p(x), q(x)\big) = \big[p(x) - q(x)\big]_+$$
+
+and on rejection you must sample from that residual, normalized:
+
+$$r(x) = \frac{[p(x) - q(x)]_+}{\sum_y [p(y) - q(y)]_+}$$
+
+**Not from `p`.** Sampling from `p` on rejection double-counts the region already covered by the accepted overlap, and it is by far the most natural wrong thing to write. Here are three samplers, one honest and one broken, at 400,000 draws:
+
+```{python}
+N = 400_000
+
+def residual(p, q):
+    """Normalized [p - q]_+, with the p == q case handled explicitly."""
+    r = torch.clamp(p - q, min=0)
+    total = r.sum()
+    if total <= 0:                  # p == q: rejection has probability zero,
+        return p.clone()            # but eager normalization would give NaN
+    return r / total
+
+
+def speculative(p, q, n, wrong=False):
+    x = torch.multinomial(q, n, replacement=True)
+    keep = torch.rand(n) < torch.clamp(p[x] / q[x], max=1.0)
+    out = x.clone()
+    n_rej = int((~keep).sum())
+    fallback = p if wrong else residual(p, q)
+    out[~keep] = torch.multinomial(fallback, n_rej, replacement=True)
+    return out
+
+
+def empirical(samples):
+    return torch.bincount(samples, minlength=V).float() / len(samples)
+
+tv = lambda a, b: 0.5 * (a - b).abs().sum().item()
+
+print(f"{'sampler':<32}{'TV from p':>12}")
+print(f"{'direct sampling from p':<32}"
+      f"{tv(empirical(torch.multinomial(p, N, replacement=True)), p):>12.5f}")
+print(f"{'speculative, residual on reject':<32}"
+      f"{tv(empirical(speculative(p, q, N)), p):>12.5f}")
+print(f"{'speculative, p on reject':<32}"
+      f"{tv(empirical(speculative(p, q, N, wrong=True)), p):>12.5f}")
+```
+
+The first line is a sampling-noise reference — that is how far 400,000 draws from `p` land from `p`. The correct sampler sits alongside it. The broken one is two orders of magnitude out, and it never raises anything: every token it returns is a legal token, drawn with a plausible-looking frequency. Only the distribution tells you.
+
+That is the recurring shape of this whole series. Nothing crashes. The answer is just wrong.
+
+**A numerical note worth internalizing.** The `residual` guard above is not defensive padding. When `p == q` the residual sums to exactly zero, and a generic `r / r.sum()` returns all-`NaN`. Rejection is *impossible* in that case, so the branch is unreachable — but only if you compute it lazily. Eager normalization poisons a tensor you were never going to use. Likewise, compute the acceptance ratio at the *sampled* token, not as a full `p / q` vector: `x ~ q` can never land where `q(x) = 0`, but the vectorized ratio is `inf` there, and in log space `exp(min(0, log p(x) - log q(x)))` gives the clamped ratio directly and cannot overflow on the way.
+
+## The overlap has a name
+
+Sum the accepted mass over all tokens and you get the acceptance probability:
+
+$$\beta = \sum_x q(x)\min\!\left(1, \frac{p(x)}{q(x)}\right) = \sum_x \min\big(p(x), q(x)\big)$$
+
+And since $\sum_x \min(p,q) = 1 - \tfrac12\sum_x |p - q|$, this is
+
+$$\boxed{\;\beta = 1 - \mathrm{TV}(p, q)\;}$$
+
+Acceptance is not an empirical property of a draft model. It is exactly one minus the total variation distance between the two next-token distributions.
+
+```{python}
+x = torch.multinomial(q, N, replacement=True)
+observed = (torch.rand(N) < torch.clamp(p[x] / q[x], max=1.0)).float().mean()
+
+print(f"sum min(p, q)   = {torch.minimum(p, q).sum():.6f}")
+print(f"1 - TV(p, q)    = {1 - tv(p, q):.6f}")
+print(f"observed accept = {observed:.6f}")
+```
+
+Write it as $\beta(h)$, because `p` and `q` here are conditioned on one prefix $h$. There is no such thing as "the acceptance rate of draft model X" — there is an acceptance rate for a target, a draft, a context, *and* a sampling policy, since the distributions that enter this argument are the post-policy ones. Temperature, top-k and top-p all change `p` and `q` before any of this runs.
+
+## Temperature moves overlap in both directions
+
+It is tempting to reason that raising temperature flattens both distributions, shrinks TV, and raises acceptance. That is true for some pairs and false for others.
+
+```{python}
+def beta_at(logits_p, logits_q, T):
+    a = torch.softmax(logits_p / T, dim=-1)
+    b = torch.softmax(logits_q / T, dim=-1)
+    return torch.minimum(a, b).sum().item()
+
+
+pairs = {
+    "same argmax":      (torch.tensor([4.0, 2.0, 1.0, 0.5]),
+                         torch.tensor([4.0, 0.5, 1.0, 2.0])),
+    "different argmax": (torch.tensor([4.0, 3.6, 1.0, 0.5]),
+                         torch.tensor([3.6, 4.0, 1.0, 0.5])),
+}
+temps = [0.1, 0.3, 0.7, 1.0, 2.0, 5.0, 20.0]
+print(f"{'':<20}" + "".join(f"T={t:<6}" for t in temps))
+for name, (lp, lq) in pairs.items():
+    print(f"{name:<20}" + "".join(f"{beta_at(lp, lq, t):<8.3f}" for t in temps))
+```
+
+The first row is U-shaped. At low temperature both collapse onto the same argmax and agree completely; warming exposes their disagreement about everything else and acceptance *falls*; warming further pushes both toward uniform and it recovers. The second row rises monotonically, because at low temperature the two models are nearly disjoint point masses on different tokens.
+
+So there is no general direction. **An acceptance rate reported without its sampling policy is incomplete**, and a system tuned at one temperature can behave differently at another — including in the direction nobody expected.
+
+(Greedy decoding fits this framework as a policy transformation of `p` and `q` too, but the degenerate distributions make the ratio arithmetic awkward, so it is cleaner to implement as its own path: propose, then accept while the argmax agrees.)
+
+---
+
+# Act II — building the block decoder, and what can go wrong in it
+
+One token at a time is not worth anyone's trouble. The payoff comes from proposing `k` tokens, scoring them in one target pass, and walking the accept/reject down the block. That is where the implementation failures live, and none of them touches the mathematics above.
+
+## Trap one: the logit at position `r` predicts the token at `r+1`
+
+When the target scores a proposed block under teacher forcing, you get logits at every position of `prefix + proposals`. The invariant is the one every causal LM obeys:
+
+```
+input      ...  x_{L-1} │  y₁   y₂   y₃
+                        ↓   ↓    ↓
+predicts                y₁  y₂   y₃
+```
+
+The logit **at** a position predicts the token **after** it. So the distribution that should judge proposal $y_1$ is the one at the last prefix position, not at $y_1$'s own position. Off by one and you verify every proposal against the conditional distribution of the *next* one.
+
+The right way to teach this is not an index formula — that depends on your framework's output convention, whether prefix logits are already cached, and zero-versus-one-based counting. The right way is a unit test: does block scoring reproduce incremental scoring, position by position?
+
+```{python}
+import torch.nn as nn
+
+class Tiny(nn.Module):
+    def __init__(self, seed, vocab=12, d=32):
+        super().__init__()
+        torch.manual_seed(seed)
+        self.emb, self.pos = nn.Embedding(vocab, d), nn.Embedding(64, d)
+        layer = nn.TransformerEncoderLayer(d, 2, 64, batch_first=True, dropout=0.0)
+        self.tr, self.out = nn.TransformerEncoder(layer, 2), nn.Linear(d, vocab)
+
+    def forward(self, x):
+        n = x.shape[1]
+        h = self.emb(x) + self.pos(torch.arange(n))[None]
+        mask = torch.triu(torch.ones(n, n, dtype=torch.bool), 1)
+        return self.out(self.tr(h, mask=mask))
+
+
+target = Tiny(1).eval()
+prefix = torch.randint(0, 12, (1, 5))
+props = torch.randint(0, 12, (1, 4))
+L, k = prefix.shape[1], props.shape[1]
+block = torch.cat([prefix, props], dim=1)
+
+with torch.no_grad():
+    block_logits = target(block)
+    # ground truth: score each proposal by re-running on exactly its own prefix
+    truth = [torch.softmax(target(block[:, :L + j])[0, -1], -1) for j in range(k)]
+
+aligned = [torch.softmax(block_logits[0, L + j - 1], -1) for j in range(k)]
+shifted = [torch.softmax(block_logits[0, L + j], -1) for j in range(k)]
+
+ok = lambda cand: all(torch.allclose(a, b, atol=1e-5) for a, b in zip(truth, cand))
+print(f"aligned slice reproduces incremental scoring : {ok(aligned)}")
+print(f"shifted slice reproduces incremental scoring : {ok(shifted)}")
+print(f"max TV between the two candidate slices      : "
+      f"{max(tv(a, b) for a, b in zip(aligned, shifted)):.3f}")
+```
+
+A TV of 0.34 between the two candidate slices, and no error anywhere. Acceptance rates under the misaligned version look entirely healthy — they are just measuring the wrong thing.
+
+## Which state actually has to be correct?
+
+The draft generated `k` proposals autoregressively, so its own cache advanced through all `k`. The target accepts three and emits a correction. Now the committed prefix is `prefix + p₁p₂p₃ + correction`, while the drafter's state still holds `p₄ … p_k` — tokens from a continuation that no longer exists.
+
+The obvious conclusion is that both models must be rolled back or correctness is lost. That is half right, and getting the other half right is worth more than the warning.
+
+**Modified rejection sampling is exact for *any* proposal distribution.** Nothing in the derivation required `q` to resemble `p`. Accepting with `min(1, p/q)` passes `min(p,q)`, and the residual `[p−q]₊` supplies the rest, whatever `q` happens to be. A drafter conditioned on a corrupted history simply proposes from some other distribution — and if the verifier computes the ratio using *that same* distribution, the output is still exactly `p`.
+
+What breaks exactness is inconsistency. Three cases, run end to end against the exact target distribution:
+
+```{python}
+#| code-fold: true
+#| code-summary: "A tiny Markov target and draft, with three switchable failure modes"
+Vb, H = 5, 3                                  # vocabulary, horizon: 125 sequences
+
+def make_table(seed, sharp):
+    g = torch.Generator().manual_seed(seed)
+    return torch.softmax(torch.randn(Vb, Vb, generator=g) * sharp, dim=-1)
+
+P_tab = make_table(1, 1.6)                                     # target
+Q_tab = make_table(2, 1.2)
+Q_tab = torch.softmax(torch.log(P_tab + 1e-9) * 0.7
+                      + torch.log(Q_tab + 1e-9) * 0.3, -1)     # draft: a blurred target
+Q_bad = make_table(7, 2.2)                                     # a badly wrong drafter
+
+pd_ = lambda s: P_tab[s[-1]]
+qd_ = lambda s: Q_tab[s[-1]]
+
+def exact_distribution(start):
+    out = {}
+    for s in itertools.product(range(Vb), repeat=H):
+        pr, cur = 1.0, [start]
+        for t in s:
+            pr *= float(pd_(cur)[t]); cur.append(t)
+        out[s] = pr
+    return out
+
+def decode(start, k, mode="correct"):
+    """mode: correct | bad_draft | mismatched_q | phantom_history | off_by_one"""
+    seq = [start]
+    while len(seq) - 1 < H:
+        draft_state, props = list(seq), []
+        for _ in range(k):
+            src = Q_bad[draft_state[-1]] if mode == "bad_draft" else qd_(draft_state)
+            t = int(torch.multinomial(src, 1))
+            draft_state.append(t); props.append(t)
+
+        for j, t in enumerate(props):
+            ctx = seq + props[:j + 1] if mode == "off_by_one" else seq + props[:j]
+            p_j = pd_(ctx)
+            if mode == "bad_draft":
+                q_j = Q_bad[(seq + props[:j])[-1]]        # the q that really proposed
+            elif mode == "mismatched_q":
+                q_j = Q_bad[(seq + props[:j])[-1]]        # but the token came from qd_
+            else:
+                q_j = qd_(seq + props[:j])
+            if torch.rand(1).item() < min(1.0, float(p_j[t] / q_j[t])):
+                continue
+            seq.extend(props[:j])
+            seq.append(int(torch.multinomial(residual(p_j, q_j), 1)))
+            break
+        else:
+            seq.extend(props)
+            seq.append(int(torch.multinomial(pd_(seq), 1)))     # the bonus token
+        if mode == "phantom_history" and len(seq) - 1 < H:
+            seq.append(int(torch.multinomial(qd_(seq), 1)))     # never verified by p
+        if len(seq) - 1 >= H:
+            break
+    return tuple(seq[1:H + 1])
+
+start = 0
+exact = exact_distribution(start)
+M = 60_000
+
+def seq_tv(sampler):
+    counts = {}
+    for _ in range(M):
+        s = sampler(); counts[s] = counts.get(s, 0) + 1
+    return 0.5 * sum(abs(counts.get(s, 0) / M - exact[s]) for s in exact)
+
+def direct():
+    cur = [start]
+    for _ in range(H):
+        cur.append(int(torch.multinomial(pd_(cur), 1)))
+    return tuple(cur[1:])
+```
+
+```{python}
+print(f"{'decoder':<48}{'TV from exact target':>22}")
+print(f"{'direct sampling from p (noise reference)':<48}{seq_tv(direct):>22.4f}")
+for label, mode in [("everything consistent", "correct"),
+                    ("badly wrong draft, verifier uses that same q", "bad_draft"),
+                    ("proposed from q, ratio computed with another q", "mismatched_q"),
+                    ("phantom token in the committed history", "phantom_history"),
+                    ("off-by-one logit alignment", "off_by_one")]:
+    print(f"{label:<48}{seq_tv(lambda m=mode: decode(start, 4, m)):>22.4f}")
+```
+
+Read those five lines carefully, because they do not say what most write-ups say.
+
+**A badly wrong drafter does not break exactness.** It sits at the noise reference alongside the correct decoder. What it destroys is efficiency — acceptance collapses, so almost every position needs a residual draw and the block retires close to one token:
+
+```{python}
+def first_accept_rate(bad):
+    hits = 0
+    for _ in range(4000):
+        src = Q_bad[start] if bad else qd_([start])
+        t = int(torch.multinomial(src, 1))
+        q_j = Q_bad[start] if bad else qd_([start])
+        hits += torch.rand(1).item() < min(1.0, float(pd_([start])[t] / q_j[t]))
+    return hits / 4000
+
+print(f"acceptance with the good draft : {first_accept_rate(False):.3f}")
+print(f"acceptance with the bad draft  : {first_accept_rate(True):.3f}")
+```
+
+**Inconsistency does break it.** Sampling from one distribution and computing the acceptance ratio with another puts the decoder far off target — that is the case where a stale draft cache genuinely hurts, because the drafter's *actual* proposal distribution changed while the verifier still uses the one it thinks it has.
+
+**And corrupting the committed history breaks it**, because `p` is then being evaluated at a prefix the model never actually produced.
+
+So the invariant is narrower and more useful than "keep both caches in sync":
+
+> **The target must be evaluated at the true committed prefix, and the acceptance ratio must use the distribution that actually produced the proposal. The draft is allowed to be wrong; the verifier is not.**
+
+That reframes rollback from a correctness requirement into two separate obligations — one about the target's history, which is a correctness bug, and one about the drafter's, which is usually an efficiency bug and only becomes a correctness bug if the recorded proposal probabilities stop matching the sampling.
+
+## The checkpoint
+
+Local tests are not useless here — the block-versus-incremental comparison earlier catches the alignment bug on its own, and an assertion that the recorded proposal probabilities came from the distribution that actually sampled would catch the mismatch. What the sequence-distribution test gives you is a single check over the *whole* state machine, including the interactions no unit test was written for. Three of these five decoders are wrong end to end, and the off-by-one one is at **TV 0.90** — nearly as far from the target as it is possible to get.
+
+The recipe is cheap and general. Shrink the vocabulary and the horizon until you can enumerate every sequence, compute each one's exact target probability by multiplying conditionals, and compare against your decoder's empirical distribution. A few hundred lines of the real thing, a few thousand samples, and you find out whether the sampler you actually built is the sampler you derived.
+
+# Act III — how many tokens does a block actually retire?
+
+## `kα` is the wrong mental model
+
+Verification is prefix-structured: proposal `j` only matters if proposals `1 … j−1` all survived. So with $\alpha_i$ the probability of accepting position $i$ **given** that everything before it was accepted,
+
+$$P(A \ge j) = \prod_{i=1}^{j} \alpha_i, \qquad E[A] = \sum_{j=1}^{k}\prod_{i=1}^{j}\alpha_i$$
+
+and each round also emits one target token — the correction on rejection, or the bonus after a full block — so the tokens the round *retires* are
+
+$$E[N] = 1 + \sum_{j=1}^{k}\prod_{i=1}^{j}\alpha_i$$
+
+Under the simplifying assumption $\alpha_i = \alpha$ for all $i$, these collapse to $E[A] = \alpha(1-\alpha^k)/(1-\alpha)$ and $E[N] = (1-\alpha^{k+1})/(1-\alpha)$.
+
+```{python}
+print(f"{'α':>6}{'k':>4}{'k·α':>8}{'E[A]':>9}{'sim':>8}{'E[N]':>9}{'sim':>8}{'P(all)':>9}")
+for a, k in [(0.8, 8), (0.5, 4), (0.95, 16)]:
+    acc = torch.rand(200_000, k) < a
+    A = torch.where(acc.all(1), torch.tensor(k), (~acc).float().argmax(1)).float()
+    EA = a * (1 - a ** k) / (1 - a)
+    EN = (1 - a ** (k + 1)) / (1 - a)
+    print(f"{a:>6}{k:>4}{k * a:>8.1f}{EA:>9.3f}{A.mean():>8.3f}"
+          f"{EN:>9.3f}{(A + 1).mean():>8.3f}{a ** k:>9.3f}")
+```
+
+At an 80% acceptance rate with `k = 8`, the intuitive estimate is 6.4 tokens. The block accepts **3.33** draft tokens and retires **4.33** in total, and only **16.8%** of blocks survive intact. The prefix structure is doing all of that: proposal 8 is only reached if the seven before it all survived, so the tail of the block contributes almost nothing.
+
+## Acceptance by position is a survivor statistic
+
+Now the part that changes how you read telemetry. Suppose half your requests are easy for the drafter and half are hard — $\beta_E = 0.95$, $\beta_H = 0.45$ — and nothing about difficulty changes within a request.
+
+```{python}
+Nsim, kpos = 200_000, 4
+easy = torch.rand(Nsim) < 0.5
+acc = torch.stack([torch.rand(Nsim) < torch.where(easy, torch.tensor(0.95),
+                                                  torch.tensor(0.45))
+                   for _ in range(kpos)], dim=1)
+
+pop, cond, surv = [], [], []
+alive = torch.ones(Nsim, dtype=torch.bool)
+for i in range(kpos):
+    pop.append(acc[:, i].float().mean().item())
+    cond.append(acc[alive, i].float().mean().item())
+    alive = alive & acc[:, i]
+    surv.append(alive.float().mean().item())
+
+fmt = lambda xs: "".join(f"{v:>9.3f}" for v in xs)
+print(f"{'position':<38}" + "".join(f"{i + 1:>9}" for i in range(kpos)))
+print(f"{'population average (all rounds)':<38}{fmt(pop)}")
+print(f"{'conditional among survivors':<38}{fmt(cond)}")
+print(f"{'measured P(A ≥ j)':<38}{fmt(surv)}")
+print(f"{'∏ population averages':<38}"
+      f"{fmt([math.prod(pop[:j + 1]) for j in range(kpos)])}   wrong")
+print(f"{'∏ conditionals':<38}"
+      f"{fmt([math.prod(cond[:j + 1]) for j in range(kpos)])}   right")
+```
+
+The population average is flat at 0.70 across all four positions. The conditional rate **climbs** — 0.70, 0.79, 0.86, 0.90 — and only the conditionals may be multiplied. Using the flat ones gives 0.241 at position 4 where the truth is 0.428, off by nearly a factor of two.
+
+Nothing became easier. Surviving the prefix is *evidence about the request*, and easy requests become overrepresented among the blocks that reach later positions. Three lines of Bayes give the whole curve:
+
+```{python}
+bE, bH, prior = 0.95, 0.45, 0.5
+print(f"{'position':>9}{'P(easy | survived)':>21}{'α predicted':>14}{'α measured':>13}")
+for j in range(kpos):
+    post = prior * bE ** j / (prior * bE ** j + (1 - prior) * bH ** j)
+    print(f"{j + 1:>9}{post:>21.3f}{post * bE + (1 - post) * bH:>14.3f}{cond[j]:>13.3f}")
+```
+
+**A rising acceptance-by-position curve can mean the drafter is getting better at later positions, or it can mean the difficult requests were eliminated earlier.** You cannot tell them apart from the curve. Log the number of blocks reaching each position alongside the rate, and don't read the curve without its denominator.
+
+---
+
+# Act IV — when is any of this faster?
+
+## The cost equation, before any speedup claim
+
+Everything so far is about statistics. None of it says the system got faster. Write the model first:
+
+$$S(k) = \frac{T_1 \cdot E[N(k)]}{D(k) + V(k) + O(k)}$$
+
+where $T_1$ is one ordinary target decode step, $D(k)$ the `k` sequential draft steps, $V(k)$ the target's verification pass over the block, and $O(k)$ everything else — acceptance sampling, cache rollback, launch overhead. $O(k)$ appears once, to be honest that the model below omits it.
+
+Normalizing by $T_1$, and approximating $D(k) \approx k\,c_d\,T_1$ for a fixed context regime:
+
+$$S(k) = \frac{E[N(k)]}{k\,c_d + c_v(k)}$$
+
+That approximation deserves a flag: a draft step is not free of context effects either, since the drafter has its own KV cache to read. It is fine for an analytic figure and wrong as a serving model.
+
+## The region where exact decoding is slower
+
+For the table below, assume a constant conditional acceptance $\alpha_i = \alpha$ — the Act III simplification, not the local $\beta(h)$ from Act I — with $k = 8$, $c_v = 1.6$ and $O = 0$.
+
+```{python}
+def speedup(alpha, c_d, k, c_v):
+    EN = (1 - alpha ** (k + 1)) / (1 - alpha)
+    return EN / (k * c_d + c_v)
+
+print("k = 8, c_v = 1.6  (verification costs 1.6 ordinary decode steps)\n")
+header = "α \\ c_d"
+print(f"{header:>9}" + "".join(f"{c:>9}" for c in [0.05, 0.10, 0.20, 0.30, 0.40]))
+for alpha in [0.4, 0.6, 0.8, 0.9]:
+    row = f"{alpha:>9}"
+    for c_d in [0.05, 0.10, 0.20, 0.30, 0.40]:
+        s = speedup(alpha, c_d, 8, 1.6)
+        row += f"{s:>8.2f}{'x' if s >= 1 else '!'}"
+    print(row)
+print("\n'!' marks a configuration that is exact and slower than not speculating")
+```
+
+There it is. The entire low-acceptance row is slower than not speculating, as is a substantial part of the high-draft-cost region — an algorithm that samples provably from the target distribution and takes longer doing it. Note the `0.90!` at α = 0.8 with an expensive draft: a respectable acceptance rate is not enough on its own. The α = 0.9 row survives even at `c_d = 0.40`, which is the point — where the boundary falls depends on every term at once. A cheap draft with poor acceptance loses because you pay for proposals that die. An accurate draft that is expensive loses because you pay too much for them.
+
+And the same `α` can sit on either side depending on `k` and the verification cost:
+
+```{python}
+print(f"{'α':>5}{'c_d':>7}{'k':>5}{'c_v':>6}{'speedup':>10}")
+for k, c_v in [(4, 1.0), (8, 1.0), (8, 1.6), (16, 2.5)]:
+    print(f"{0.8:>5}{0.15:>7}{k:>5}{c_v:>6}{speedup(0.8, 0.15, k, c_v):>9.2f}x")
+```
+
+Same acceptance rate, same draft cost, and the speedup runs from 2.10× to parity. **An acceptance number on its own tells you nothing about whether the system got faster.**
+
+Two consequences fall out of the equation rather than from opinion. A larger or better-trained draft may raise `α`, but it usually raises `c_d` too, so the best drafter is not necessarily the most accurate one — it is the one giving the best end-to-end progress per unit time. And the optimal `k` is a property of the whole configuration, not a constant: past some point, later proposals are almost never reached, so you are paying for draft steps whose output is discarded.
+
+```{python}
+print(f"{'k':>4}" + "".join(f"{f'α={a}':>10}" for a in [0.5, 0.7, 0.9]))
+for k in [1, 2, 4, 8, 16, 32]:
+    print(f"{k:>4}" + "".join(f"{speedup(a, 0.15, k, 1.0 + 0.05 * k):>9.2f}x"
+                              for a in [0.5, 0.7, 0.9]))
+```
+
+## Batch size, as a consequence
+
+The verification term $V(k)$ is where the serving regime enters. For a large decoder in the low-batch, memory-bandwidth-bound regime that motivates the technique in the first place, a target forward is dominated by reading weights, so scoring `k` positions costs little more than scoring one. As batching grows the workload can move toward higher arithmetic intensity, changing the relative cost of block verification: verifying `k` positions for `B` sequences is `B·k` positions of work.
+
+That does not mean speculation stops helping at scale — it means $c_v(k)$ moved, so a `k` tuned for low-batch latency need not remain optimal under load. The equation decides, not a rule of thumb.
+
+## What to log
+
+```
+draft length k                   target verification rounds
+tokens retired per target call
+blocks reaching each position    ← the denominator for the curve
+conditional acceptance by position
+fully-accepted block fraction
+draft time and verify time, separately
+sampling policy and temperature
+batch / load regime
+end-to-end tokens per second
+```
+
+These are different things to validate, and one does not imply the other. **A high acceptance rate does not prove you are faster, and a speedup does not prove your acceptance logic is correct.** The first is the cost equation; the second is the black-box distribution test.
+
+---
+
+## What to carry away
+
+- **The acceptance rule is derivable, not arbitrary.** Accepting with $\min(1, p/q)$ passes exactly $\min(p,q)$ of the mass, which is why rejection must sample the residual $[p-q]_+$ and not `p`.
+- **$\beta(h) = 1 - \mathrm{TV}(p,q)$ at a given prefix.** Acceptance is a property of a target, a draft, a context and a sampling policy — never of the draft alone.
+- **Temperature moves overlap in either direction.** The same-argmax case is U-shaped; the different-argmax case rises. A rate quoted without its policy is incomplete.
+- **The draft is allowed to be wrong; the verifier is not.** A badly wrong drafter still samples exactly from the target — it just accepts rarely. What breaks exactness is computing the ratio with a distribution other than the one that proposed (TV 0.28), or evaluating the target at a prefix it never produced (TV 0.05). A one-position logit misalignment gives TV 0.90. All of them leave the rejection-sampling equations themselves looking perfectly correct — the alignment unit test catches the indexing bug, and the end-to-end distribution test checks the whole state machine.
+- **Test the decoder end to end.** Small vocabulary, short horizon, exact enumeration. It is the only test that catches indexing and state errors.
+- **`kα` overestimates the payoff.** At α = 0.8, k = 8: 3.33 accepted, 4.33 retired, and 16.8% of blocks intact.
+- **Acceptance by position is a survivor statistic.** Log the denominator, or you will read selection as improvement.
+- **Exactness is not speed.** There is a real region where the algorithm is provably correct and slower than not using it.
+
+If one sentence survives: *exactness comes from the rejection rule and survives an appalling draft; what it does not survive is a verifier reading the wrong history or the wrong proposal distribution.*
+
+## Where this goes next
+
+Modern systems generalize where proposals come from and how blocks are verified — multiple candidates, tree-structured verification, drafts produced by the target itself. The draft-verify-reject mechanism here is the foundation underneath all of them.
+
+## References
+
+- Leviathan, Kalman and Matias, [*Fast Inference from Transformers via Speculative Decoding*](https://proceedings.mlr.press/v202/leviathan23a.html), ICML 2023 — the algorithm, the exactness proof, and the closed-form token-count analysis under an i.i.d. acceptance assumption.
+- Chen et al., [*Accelerating Large Language Model Decoding with Speculative Sampling*](https://arxiv.org/abs/2302.01318), 2023 — the parallel-verification framing and its dependence on favourable target-scoring latency.
