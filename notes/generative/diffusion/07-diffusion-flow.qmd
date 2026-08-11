@@ -1,0 +1,508 @@
+---
+title: "Diffusion and Flow Matching: Three Choices Wearing Two Names"
+description: "The path you train on, the quantity you regress, and the dynamics you integrate are separate decisions. This post builds one interpolant that covers both families, shows why the score is not the noise you added, derives the loss reweighting that makes ε- and x-prediction different in practice, and measures why straight training pairs do not give straight generated trajectories."
+categories: [generative-models, diffusion, flow-matching]
+date: 2026-08-11
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+Ask what separates diffusion from flow matching and you will usually get some version of *diffusion is stochastic denoising, flow matching is deterministic transport*. It is a tidy answer and it is not where the boundary is. Diffusion has had a deterministic sampler since 2020, and flow matching works perfectly well on the same Gaussian paths diffusion uses.
+
+The confusion is that the literature bundles three separable design choices and gives the bundles two names:
+
+1. **The path.** How you interpolate between data and noise.
+2. **The regression target.** What the network is asked to predict at each point on that path.
+3. **The dynamics.** How you integrate the learned field to generate.
+
+Almost every "new method" changes one of these and renames all three. They are separable — you can reason about each on its own — though not fully independent, since using one prediction target with a given sampler requires the conversions above. This post builds each axis from scratch, and along the way runs into three things that are easy to get wrong: the score is not the noise you added, two exactly convertible targets do not train the same, and straight training pairs do not produce straight generated trajectories.
+
+> **TL;DR** — One interpolant `x_t = α_t·x + σ_t·z` covers DDPM and rectified flow as different choices of `(α, σ)`. On that path, `x`, `z` and the path velocity `u = ẋ_t` are pointwise convertible given `(x_t, t)` — but the score is not: it is `−E[z|x_t]/σ_t`, a conditional expectation, and a single noise draw misses it by a mile. The parameterizations are the *same objective under a reweighting*, `‖x̂−x‖² = (σ/α)²‖ẑ−z‖²` exactly, which spans four orders of magnitude across `t` and is why the choice matters in practice. Then the flagship: MSE regression learns `E[ẋ_t | x_t]`, so at a crossing it averages incompatible conditional velocities — straight training pairs do not give a **constant-velocity** learned flow. Measured on a trained 2-D model with everything else held fixed, one reflow round takes the straightness error from **2.92 to 0.0044** and one-step sampling error from **2.57 to 0.0075**, while at 64 steps the difference falls within the seed-to-seed spread. Straightness buys cheap sampling, not quality.
+
+**Conventions, fixed once.** `x ~ p_data`, `z ~ p_noise`. Time runs **`t = 0` at data, `t = 1` at noise**. Training paths are written in the corruption direction; generation traverses them from `t = 1` back to `t = 0`. The two literatures orient time oppositely and use `x_0`/`x_1` to mean opposite things, which is a large fraction of why reading both is confusing.
+
+```{python}
+import math
+import time
+import torch
+import torch.nn as nn
+
+torch.set_num_threads(1)
+torch.manual_seed(0)
+print("torch", torch.__version__)
+```
+
+---
+
+# Act I — a path, before any network
+
+## Moving one distribution onto another
+
+Forget denoising for a moment. The problem is transport: you have samples from something simple and you want samples from something complicated.
+
+Pick any pair `(x, z)` and connect them. The simplest connection is a straight line, `x_t = (1−t)x + t·z`, and along it the pair moves at constant velocity `z − x`. Do that for many pairs and you get a path of distributions `p_t` sliding from `p_data` at `t=0` to `p_noise` at `t=1`.
+
+Here is the gap that makes this a learning problem, and it is worth sitting with before any machinery arrives. At generation time you have **a particle at a position**, not a pair. Many pairs pass through the same point at the same time, and they do not agree about where to go next. Whatever the network learns has to be a single answer at each `(x_t, t)`.
+
+Act IV is about what that single answer turns out to be. First, the path itself.
+
+## One interpolant covers both families
+
+Write the general form:
+
+$$x_t = \alpha_t\,x + \sigma_t\,z$$
+
+Every model in this post is a choice of the two schedules. DDPM's forward process, accumulated, is `α_t = √ᾱ_t` and `σ_t = √(1−ᾱ_t)`. Rectified flow is `α_t = 1−t`, `σ_t = t`. That is the entire difference at this level.
+
+```{python}
+def cosine_schedule(t):
+    """A continuous variance-preserving cosine path, for illustration.
+
+    Not the 2020 DDPM schedule, which is a discrete beta sequence; the cosine
+    form came later in the DDPM family."""
+    a = torch.cos(t * math.pi / 2)
+    return a, torch.sin(t * math.pi / 2)
+
+def linear_schedule(t):
+    """Rectified-flow style straight-line path."""
+    return 1 - t, t
+
+ts = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
+print(f"{'t':>6}{'cosine α':>11}{'cosine σ':>11}{'α²+σ²':>9}"
+      f"{'linear α':>11}{'linear σ':>11}{'α²+σ²':>9}")
+for t in ts:
+    ca, cs = cosine_schedule(t)
+    la, ls = linear_schedule(t)
+    print(f"{t:>6.2f}{ca:>11.4f}{cs:>11.4f}{ca**2+cs**2:>9.3f}"
+          f"{la:>11.4f}{ls:>11.4f}{la**2+ls**2:>9.3f}")
+```
+
+The last column is the one distinction people actually feel. The cosine path is **variance preserving**: `α² + σ² = 1` at every `t`, so if `x` and `z` are independent and both have unit variance, the marginal variance of `x_t` stays at one the whole way. The linear path is not: at `t = 0.5` it has shrunk to `0.5`. Neither is wrong. They are different curves through the same space, and the sampler has to cope with whichever you chose.
+
+## The forward process, two ways
+
+DDPM is usually introduced as a chain: add a little noise, then a little more, hundreds of times. The closed form above claims you can jump straight to any `t`. Those had better agree.
+
+```{python}
+def iterative_noise(x, n_steps, betas):
+    """Apply the Markov chain step by step."""
+    out = x.clone()
+    for i in range(n_steps):
+        out = torch.sqrt(1 - betas[i]) * out + torch.sqrt(betas[i]) * torch.randn_like(out)
+    return out
+
+n_steps = 200
+betas = torch.linspace(1e-4, 0.02, n_steps)
+alpha_bar = torch.cumprod(1 - betas, 0)
+
+x = torch.randn(50_000) * 0.7 + 1.5           # some non-standard data
+k = 120                                        # jump to step 120
+
+it = iterative_noise(x, k, betas)
+direct = torch.sqrt(alpha_bar[k-1]) * x + torch.sqrt(1 - alpha_bar[k-1]) * torch.randn_like(x)
+
+print(f"iterative : mean {it.mean():>8.4f}   std {it.std():.4f}")
+print(f"closed    : mean {direct.mean():>8.4f}   std {direct.std():.4f}")
+print(f"√ᾱ·μ_data = {(torch.sqrt(alpha_bar[k-1]) * 1.5):.4f}")
+```
+
+They match, which is the property that makes diffusion trainable at all: you can sample a random `t`, jump there in one operation, and never simulate the chain.
+
+---
+
+# Act II — what should the network predict?
+
+## Three targets, one piece of information
+
+Given `x_t = α_t x + σ_t z`, and given that you know `x_t` and `t`, the quantities `x`, `z` and the path velocity are related by fixed algebra. Write the velocity as $u_t = \dot x_t = \dot\alpha_t x + \dot\sigma_t z$ — deliberately *not* `v`, because in the diffusion literature `v`-prediction means a specific linear combination under VP parameterization, and conflating the two causes real confusion. For the linear path $u_t = z - x$, and the three quantities recover each other:
+
+$$\hat x = \frac{x_t - \sigma_t \hat z}{\alpha_t}, \qquad \hat z = \frac{x_t - \alpha_t \hat x}{\sigma_t}$$
+
+Away from the singular endpoints — where $\alpha_t = 0$ or $\sigma_t = 0$ and one of these divisions blows up — the targets are directly convertible. More generally, the pair $(x_t, u_t)$ determines both endpoints whenever the schedule system is non-degenerate.
+
+```{python}
+a_t, s_t = 0.6, 0.8
+x_true = torch.randn(10_000)
+z_true = torch.randn(10_000)
+x_t = a_t * x_true + s_t * z_true
+
+# recover each target from the other two quantities
+x_from_z = (x_t - s_t * z_true) / a_t
+z_from_x = (x_t - a_t * x_true) / s_t
+
+print(f"x recovered from (x_t, z) : max error {(x_from_z - x_true).abs().max():.2e}")
+print(f"z recovered from (x_t, x) : max error {(z_from_x - z_true).abs().max():.2e}")
+
+# and on the linear path, u = z - x recovers both endpoints from x_t alone
+t_lin = 0.35
+xt_lin = (1 - t_lin) * x_true + t_lin * z_true
+u_lin = z_true - x_true
+print(f"x from (x_t, u)           : max error "
+      f"{((xt_lin - t_lin * u_lin) - x_true).abs().max():.2e}")
+print(f"z from (x_t, u)           : max error "
+      f"{((xt_lin + (1 - t_lin) * u_lin) - z_true).abs().max():.2e}")
+```
+
+So a model that predicts noise implicitly predicts the clean sample, and vice versa. That much is genuinely just rearrangement.
+
+## The score is not one of them
+
+Here is where people — including plenty of tutorials — quietly go wrong. It is tempting to add the score to that list, on the grounds that for Gaussian corruption `s_t(x) = −z/σ_t`. It is not. The score is
+
+$$s_t(x) = \nabla_x \log p_t(x) = -\frac{1}{\sigma_t}\,\mathbb{E}[\,z \mid x_t = x\,]$$
+
+a **conditional expectation**, not the noise realization you happened to draw. Those are wildly different objects, and you can see the gap directly by building a case where the true score is available analytically.
+
+```{python}
+mu = torch.tensor([-2.0, 2.0])                 # two-mode data
+w = torch.tensor([0.5, 0.5])
+a, s = 0.6, 0.8
+
+def true_score(xq):
+    """Analytic ∇ log p_t for a Gaussian mixture pushed through the interpolant."""
+    m, v = a * mu, s ** 2
+    comp = w * torch.exp(-0.5 * (xq[:, None] - m[None]) ** 2 / v) / math.sqrt(2 * math.pi * v)
+    post = comp / comp.sum(1, keepdim=True)
+    return (post * (-(xq[:, None] - m[None]) / v)).sum(1)
+
+N = 400_000
+idx = torch.multinomial(w, N, replacement=True)
+x0, eps = mu[idx], torch.randn(N)
+xt = a * x0 + s * eps
+
+print(f"{'x_t':>7}{'one draw of -z/σ':>19}{'-E[z|x_t]/σ':>15}{'true score':>13}")
+for xq in [-2.0, -0.5, 0.0, 0.5, 2.0]:
+    sel = (xt - xq).abs() < 0.05
+    single = (-eps[sel] / s)[0].item()
+    averaged = (-eps[sel] / s).mean().item()
+    print(f"{xq:>7.1f}{single:>19.3f}{averaged:>15.3f}"
+          f"{true_score(torch.tensor([xq])).item():>13.3f}")
+
+sel0 = (xt).abs() < 0.05
+print(f"\nspread of -z/σ at x_t = 0: std {(-eps[sel0] / s).std():.3f}")
+```
+
+At `x_t = 0` the true score is zero — by symmetry, the density has a local structure that pulls neither way — and a single `−z/σ` draw comes back at `−1.9`, with a standard deviation of nearly `1.9` across draws. The individual noise is not a noisy version of the score. It is a *sample whose conditional mean is* the score.
+
+This matters beyond pedantry. It is why regression works at all: minimizing squared error against `z` gives you `E[z|x_t]`, which is exactly the object the reverse dynamics need. The network is not learning to invert a particular noise draw. It is learning a conditional average, and the fact that those coincide is the whole trick.
+
+## The parameterizations are one objective under a weight
+
+Since `x`, `z` and `u` are pointwise convertible, you might expect training on any of them to be equivalent. It is not, and the reason is exactly derivable rather than empirical.
+
+Convert a prediction: `x̂ − x = −(σ_t/α_t)(ẑ − z)`. Square it:
+
+$$\|\hat x - x\|^2 = \left(\frac{\sigma_t}{\alpha_t}\right)^2\|\hat z - z\|^2$$
+
+```{python}
+z_hat = z_true + 0.3 * torch.randn_like(z_true)      # any imperfect predictor
+x_hat = (x_t - s_t * z_hat) / a_t
+
+mse_z = ((z_hat - z_true) ** 2).mean()
+mse_x = ((x_hat - x_true) ** 2).mean()
+print(f"MSE in z-space : {mse_z:.6f}")
+print(f"MSE in x-space : {mse_x:.6f}")
+print(f"ratio {mse_x / mse_z:.6f}   (σ/α)² = {(s_t / a_t) ** 2:.6f}")
+```
+
+Exact, not approximate. So the targets are the *same objective under the weight* `w_x(t) = (σ_t/α_t)² = 1/\text{SNR}_t`. Which would be a footnote, except for how violently that weight varies:
+
+```{python}
+print(f"{'t':>6}{'α':>9}{'σ':>9}{'SNR':>12}{'weight on x-loss':>19}")
+for t in [0.05, 0.2, 0.4, 0.6, 0.8, 0.95]:
+    al, sg = cosine_schedule(torch.tensor(t))
+    print(f"{t:>6}{al:>9.4f}{sg:>9.4f}{(al/sg)**2:>12.4f}{(sg/al)**2:>19.4f}")
+
+lo, hi = (cosine_schedule(torch.tensor(0.05))[1] / cosine_schedule(torch.tensor(0.05))[0]) ** 2, \
+         (cosine_schedule(torch.tensor(0.95))[1] / cosine_schedule(torch.tensor(0.95))[0]) ** 2
+print(f"\nspan of the implied weight over this range: {hi / lo:.0f}x")
+```
+
+Under this schedule and this range of `t`, a plain MSE on `x` emphasises the high-noise end about twenty-six thousand times more than a plain MSE on `z` does. Same information, same convertibility, entirely different training emphasis.
+
+> **Pointwise-convertible targets do not imply equivalent optimization when you hold the loss weighting fixed.**
+
+Compute `w_x(t) = (σ_t/α_t)²` for your own schedule and you can read off what your loss is actually prioritizing. Much of what looks like a debate about parameterizations is a debate about weighting, conducted without saying so — which is one of the things Karras et al. set out to disentangle.
+
+---
+
+# Act III — the crossing problem
+
+## What regression actually returns
+
+Now back to the gap from Act I. A particle sits at `x_t`. Many training pairs pass through that point. What does the network learn to do there?
+
+Squared-error regression returns the conditional mean of its target. So the learned field is
+
+$$u^*(x, t) = \mathbb{E}[\,\dot x_t \mid x_t = x\,]$$
+
+and at a point where two pairs cross with incompatible velocities, that expectation is their **average**. Not either one.
+
+The smallest possible demonstration: endpoints at `±1` on both sides, paired independently. Four pairings occur equally often, and half of them are *stationary* — a pair that starts and ends at `−1` never moves. Only the two crossing pairings go anywhere, and they are the only ones that pass through zero.
+
+```{python}
+M = 200_000
+x_end = torch.where(torch.rand(M) < 0.5, -1.0, 1.0)       # data side
+z_end = torch.where(torch.rand(M) < 0.5, -1.0, 1.0)       # noise side
+
+def marginal_velocity(xq, t, bw=0.05):
+    """E[ż | x_t = xq], estimated by kernel-weighting the pairs passing nearby."""
+    xt = (1 - t) * x_end + t * z_end
+    vel = z_end - x_end
+    w = torch.exp(-0.5 * ((xq[:, None] - xt[None, :]) / bw) ** 2)
+    return (w * vel[None, :]).sum(1) / (w.sum(1) + 1e-12)
+
+for a in [-1.0, 1.0]:
+    for b in [-1.0, 1.0]:
+        frac = ((x_end == a) & (z_end == b)).float().mean()
+        kind = "stationary" if a == b else "passes through 0"
+        print(f"  {a:+.0f} -> {b:+.0f}: {frac:.3f}   {kind}")
+
+print(f"\nat (x=0, t=0.5) only the crossing pairs contribute, with velocities +2 and -2")
+print(f"what the regression returns: "
+      f"{marginal_velocity(torch.tensor([0.0]), 0.5).item():+.4f}")
+```
+
+Conditioned on being at zero at the halfway point, the only pairs present are the two crossing types, arriving with velocities `+2` and `−2`. The regression returns their mean, which is zero. And this is not a failure of the network or of the optimizer — MSE is correctly solving the marginal regression problem it was handed. **Straight conditional interpolants do not imply a constant-velocity learned flow.**
+
+So the natural expectation — linear paths give straight trajectories, straight trajectories integrate in one step — does not follow. What actually happens to the trajectories is a question about a trained model, so train one.
+
+## A real model, in two dimensions
+
+Eight Gaussian modes in a ring for data, a standard Gaussian for noise, straight-line interpolants, independent coupling. Flow matching in six lines.
+
+```{python}
+#| code-fold: true
+#| code-summary: "Data, the velocity network, and the flow-matching training loop"
+def data_sample(n, g=None):
+    k = torch.randint(0, 8, (n,), generator=g)
+    ang = k.float() * math.pi / 4
+    centres = torch.stack([torch.cos(ang), torch.sin(ang)], 1) * 4.0
+    return centres + 0.25 * torch.randn(n, 2, generator=g)
+
+def noise_sample(n, g=None):
+    return torch.randn(n, 2, generator=g)
+
+
+class VelocityNet(nn.Module):
+    def __init__(self, h=128):
+        super().__init__()
+        self.f = nn.Sequential(nn.Linear(3, h), nn.SiLU(), nn.Linear(h, h), nn.SiLU(),
+                               nn.Linear(h, h), nn.SiLU(), nn.Linear(h, 2))
+
+    def forward(self, x, t):
+        return self.f(torch.cat([x, t.view(-1, 1)], dim=1))
+
+
+def train_flow(pairs_fn, steps=4000, bs=1024, seed=0):
+    torch.manual_seed(seed)
+    net = VelocityNet()
+    opt = torch.optim.Adam(net.parameters(), 2e-3)
+    for _ in range(steps):
+        x, z = pairs_fn(bs)                       # x at t=0, z at t=1
+        t = torch.rand(bs)
+        xt = (1 - t)[:, None] * x + t[:, None] * z
+        target = z - x                            # the conditional velocity
+        loss = ((net(xt, t) - target) ** 2).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+    return net
+
+
+@torch.no_grad()
+def generate(net, z0, steps):
+    """Integrate from t=1 (noise) down to t=0 (data)."""
+    x = z0.clone(); dt = 1.0 / steps; traj = [x.clone()]
+    for i in range(steps):
+        t = 1.0 - i * dt
+        x = x - dt * net(x, torch.full((x.shape[0],), t))
+        traj.append(x.clone())
+    return x, torch.stack(traj)
+```
+
+The training loop is the whole of flow matching: sample a pair, sample a time, interpolate, regress the velocity that pair has. No ODE is solved during training, which is what "simulation-free" means.
+
+Now measure how straight the resulting flow is. The metric matters here — an arc-length-over-chord ratio blows up for any particle whose endpoints happen to land near each other, which measures nothing. Instead compare the velocity along the path against the net displacement:
+
+$$S = \mathbb{E}_t\left\|\,(x_{\text{end}} - x_{\text{start}}) - u(x_t, t)\,\right\|^2$$
+
+which is zero exactly when every path is a straight line traversed at **constant speed**, and never divides by anything that can vanish. Note what that does and does not measure: a geometrically straight trajectory covered at varying speed still scores non-zero, so this is a deviation-from-constant-velocity measure rather than a curvature measure in the differential-geometry sense. That is the right quantity here, because constant velocity is exactly what makes a single Euler step exact.
+
+```{python}
+t_start = time.time()
+
+@torch.no_grad()
+def straightness(net, z0, steps=100):
+    x_end, traj = generate(net, z0, steps)
+    disp = x_end - z0
+    total = 0.0
+    for i in range(steps):
+        t = 1.0 - i / steps
+        v = -net(traj[i], torch.full((z0.shape[0],), t))   # velocity along generation
+        total += ((disp - v) ** 2).sum(1).mean().item()
+    return total / steps
+
+
+independent_pairs = lambda n: (data_sample(n), noise_sample(n))
+net_base = train_flow(independent_pairs)
+
+z_test = noise_sample(2000, torch.Generator().manual_seed(7))
+real = data_sample(2000, torch.Generator().manual_seed(8))
+
+s_base = straightness(net_base, z_test)
+print(f"straightness of the learned flow (independent coupling): {s_base:.4f}")
+print(f"[trained in {time.time() - t_start:.0f}s]")
+```
+
+Nearly 3, where a perfectly straight flow would be 0. The training pairs were all straight lines. The learned flow is not.
+
+## Reflow: change the coupling, not the paths
+
+If the problem is that unrelated pairs cross, the fix is to stop pairing them at random. Rectified flow's move is to let the trained model choose the pairing: push noise samples through the ODE, keep each noise point with **its own** generated endpoint, and refit straight interpolants under that new coupling.
+
+It is worth being careful about *why* this helps, because the tempting explanation is wrong. A well-posed ODE's trajectories cannot cross at the same time — but the straight chords you draw between its endpoints certainly can. A flow that simply swaps two points is a clean counterexample: the trajectories are arcs that never touch, while the two chords are the *same segment*, coinciding exactly at `t = 0.5`. So reflow is not a construction that eliminates crossings by fiat. It replaces an arbitrary pairing with the deterministic one the first flow induces, and the theory says repeating that tends to straighten the result.
+
+```{python}
+with torch.no_grad():
+    z_bank = noise_sample(60_000, torch.Generator().manual_seed(11))
+    x_bank, _ = generate(net_base, z_bank, 100)          # pair each z with its own output
+
+def reflow_pairs(n):
+    idx = torch.randint(0, z_bank.shape[0], (n,))
+    return x_bank[idx], z_bank[idx]
+
+net_reflow = train_flow(reflow_pairs, seed=0)      # same init as the base model
+s_reflow = straightness(net_reflow, z_test)
+
+print(f"independent coupling : {s_base:.4f}")
+print(f"after one reflow     : {s_reflow:.4f}   ({s_base / s_reflow:.0f}x straighter)")
+```
+
+A factor of 669, with the interpolant, the loss, the architecture and the initialization all held fixed. So within this setup, the measured straightness error is governed by which endpoints you connect, not by the fact that you connected them with a straight line. That is a statement about this experiment, not a general claim that the path family is irrelevant — a different interpolant would give a different flow too.
+
+One caveat about this particular experiment. The reflow endpoints are the first model's *generated* samples, not fresh draws from `data_sample()`, so the second model is fitting a slightly different target distribution. How different is worth measuring rather than waving at:
+
+```{python}
+def energy_distance(a, b):
+    d = lambda p, q: torch.cdist(p, q).mean()
+    return (2 * d(a, b) - d(a, a) - d(b, b)).item()
+
+real_b = data_sample(2000, torch.Generator().manual_seed(9))
+print(f"energy(real, real')          = {energy_distance(real, real_b):.4f}   sampling floor")
+print(f"energy(reflow bank, real)    = {energy_distance(x_bank[:2000], real):.4f}")
+```
+
+An order of magnitude above the floor, so the difference is real and not sampling noise: the second model is trained toward the first model's output distribution, not toward the data. This approximates a coupling-only intervention rather than being one, and the straightness result should be read with that in mind.
+
+---
+
+# Act IV — what straightness buys
+
+## Steps, and what they cost
+
+Now the payoff. Integrate both models with progressively fewer steps and measure how far the generated distribution lands from the real one. Energy distance is a reasonable choice for 2-D: it is zero only when the distributions match and needs no density estimate.
+
+```{python}
+print(f"{'NFE':>5}{'independent':>15}{'reflowed':>12}{'ratio':>9}")
+for nfe in [1, 2, 4, 8, 16, 64]:
+    a, _ = generate(net_base, z_test, nfe)
+    b, _ = generate(net_reflow, z_test, nfe)
+    ea, eb = energy_distance(a, real), energy_distance(b, real)
+    print(f"{nfe:>5}{ea:>15.4f}{eb:>12.4f}{ea / eb:>8.1f}x")
+```
+
+Read the two ends of that table separately, because they say different things.
+
+**At one step the difference is enormous** — a factor of 341.9 in this run. The base model's single Euler step lands far from the target distribution: extrapolating the velocity at `t = 1` across the entire interval is only valid if that velocity holds throughout, and here it does not. The reflowed model's single step is nearly as good as its sixty-four.
+
+**At sixty-four steps the gap has closed.** Whether it has closed *exactly* is a question a single run cannot answer, so repeat the whole pipeline across three seeds and look at the spread:
+
+```{python}
+def run_seed(seed, steps=2000):
+    base = train_flow(independent_pairs, steps=steps, seed=seed)
+    with torch.no_grad():
+        zb = noise_sample(20_000, torch.Generator().manual_seed(11 + seed))
+        xb, _ = generate(base, zb, 100)
+    pairs = lambda n: (lambda i: (xb[i], zb[i]))(torch.randint(0, 20_000, (n,)))
+    rf = train_flow(pairs, steps=steps, seed=seed)
+    e = lambda net, k: energy_distance(generate(net, z_test, k)[0], real)
+    return e(base, 1), e(rf, 1), e(base, 64), e(rf, 64)
+
+rows = [run_seed(s) for s in [0, 1, 2]]
+print(f"{'seed':>5}{'base NFE=1':>13}{'reflow NFE=1':>15}"
+      f"{'base NFE=64':>14}{'reflow NFE=64':>16}")
+for s, r in zip([0, 1, 2], rows):
+    print(f"{s:>5}{r[0]:>13.4f}{r[1]:>15.4f}{r[2]:>14.4f}{r[3]:>16.4f}")
+
+b64 = [r[2] for r in rows]; r64 = [r[3] for r in rows]
+print(f"\nNFE=64  base spread {max(b64)-min(b64):.4f}   reflow spread {max(r64)-min(r64):.4f}")
+print(f"NFE=64  |mean difference| {abs(sum(b64)/3 - sum(r64)/3):.4f}")
+```
+
+These runs are deliberately shorter than the headline one — 2,000 steps instead of 4,000 — which is why the absolute numbers sit a little higher. What matters is the comparison within each row. The one-step advantage is enormous and consistent at every seed. At sixty-four steps the mean difference between the two models (0.0008) is **several times smaller than the run-to-run spread of either one** (0.0044 and 0.0053), so the right statement is that the gap closes to within the noise of this experiment — not that the two are provably equal. That is the honest version of the result:
+
+> **In this experiment, reflow's benefit is concentrated at low step counts, not in the many-step distribution metric.**
+
+Straightness is a property of how numerically forgiving the trajectory is, not of how well the distribution was learned. If you are willing to spend the steps, the curved flow gets there too. The entire value proposition of straightening is few-step sampling — which happens to be what almost everyone wants, but is a narrower claim than "flow matching is better."
+
+Rectified flow makes exactly this connection: straighter paths tolerate coarser integration. The wider few-step literature attacks the problem from directions that are *not* the same quantity — a better solver reduces discretization error for a field you leave alone, reflow changes the trajectory geometry, and distillation or consistency methods learn a finite-time map rather than straightening anything.
+
+## Deterministic does not mean cheap
+
+That distinction also cleans up the diffusion/flow story. It is often said that flow matching needs fewer steps because it is deterministic. But the base model above is deterministic, is trained on perfectly straight interpolants, and needs sixteen steps to reach what the reflowed model reaches in one.
+
+Trajectory geometry strongly affects low-NFE integration error — but the steps you need also depend on how smoothly the field varies, how much model error there is, the solver's order, and the discretization. What the experiment settles is narrower and still useful: determinism alone buys nothing. Which is also why the deterministic samplers on the diffusion side — DDIM, and the probability-flow ODE — do not automatically give you one-step generation either.
+
+Two things worth keeping distinct there, since they are routinely merged. **Score-SDE** shows that a diffusion SDE has a corresponding deterministic ODE with the same time marginals: same trained model, two samplers. **DDIM** arrives from a different direction — a family of non-Markovian forward processes sharing the DDPM training objective, of which a deterministic sampler is one member. They are closely related in continuous time, and they are not the same derivation.
+
+---
+
+# The axes, filled in
+
+Putting it together, the three decisions this post separated — plus the backbone, which is a fourth and is orthogonal to all of them:
+
+| | path | target | dynamics |
+|---|---|---|---|
+| **DDPM** | discrete VP Gaussian path via β_t / ᾱ_t | `z` | ancestral, stochastic |
+| **DDIM** | same one-time marginals / ᾱ schedule; non-Markovian joint | same as DDPM | deterministic sampler in that family |
+| **Score-SDE** | VP or VE, continuous | score | reverse SDE **or** probability-flow ODE |
+| **EDM** | VE with tuned σ(t) | `x` with preconditioning | 2nd-order Heun |
+| **Flow matching** | any Gaussian path, incl. diffusion | `u` (path velocity) | ODE |
+| **Rectified flow** | linear | `u` (path velocity) | ODE, straightened by reflow |
+
+Stochastic interpolants make the overlap explicit at a broader level still: one interpolant construction gives rise both to deterministic transport equations and to families of stochastic diffusion dynamics between the same endpoints.
+
+Read down the columns rather than across the rows and most of the apparent taxonomy dissolves. DDPM and DDIM differ only in the third column — same trained model. Flow matching and diffusion overlap in the first, because the framework admits diffusion paths. EDM changes all three at once relative to DDPM, which is exactly why it improved so much and why comparing a 2020 DDPM against a modern flow model tells you nothing about paths versus flows.
+
+That last point is worth being disciplined about. If you read a comparison claiming one family beats the other, check whether the path, the target, the weighting, the solver and the backbone were held fixed. Usually several moved at once.
+
+---
+
+## What to carry away
+
+- **One interpolant covers both families.** `x_t = α_t x + σ_t z`; DDPM and rectified flow are two choices of the schedules. The variance-preserving property is a consequence of the choice, not a defining feature of diffusion.
+- **`x`, `z` and the path velocity `u` are pointwise convertible; the score is not.** The score is `−E[z|x_t]/σ_t`. A single noise draw sits nearly two standard deviations from it. Regression works precisely because minimizing MSE returns that conditional mean.
+- **The parameterizations are one objective under a weight.** `‖x̂−x‖² = (σ/α)²‖ẑ−z‖²`, exactly. Compute `w_x(t) = (σ_t/α_t)²` for your schedule and you can read off what your loss is actually prioritizing; here it spans four orders of magnitude.
+- **MSE learns `E[ẋ_t | x_t]`.** At a crossing it averages incompatible conditional velocities — measured, `+2` and `−2` returning `+0.005`. Straight training pairs do not give a straight learned field.
+- **The coupling drives the measured straightness here.** With the linear interpolant, loss, architecture and initialization all fixed, changing the induced coupling took the straightness error from 2.92 to 0.0044 — squared velocity-deviation units, so the ratio carries the meaning, not the absolute value.
+- **Straightness buys steps, not quality.** One-step error improved by a factor of 342; at 64 steps the difference was smaller than the run-to-run spread across three seeds. Deterministic does not mean cheap.
+
+If one sentence survives: *the path you train on, the quantity you regress, and the dynamics you integrate are three separate decisions, and "diffusion versus flow" is a debate about bundles rather than about any one of them.*
+
+## Where this goes next
+
+Everything here was 2-D and 4,000 gradient steps, running end to end in under two minutes on a CPU, which is enough to see mechanisms and not enough to say anything about images. The natural sequels are the design-space question — what happens when you tune the path, preconditioning and solver together rather than one at a time — and the architectural axis, where holding the transport fixed and varying the backbone (or the reverse) is the only way to attribute a gain to either.
+
+## References
+
+- Ho, Jain and Abbeel, [*Denoising Diffusion Probabilistic Models*](https://arxiv.org/abs/2006.11239), 2020 — the discrete formulation, the closed-form jump to arbitrary `t`, and the `z`-prediction objective.
+- Song et al., [*Score-Based Generative Modeling through Stochastic Differential Equations*](https://arxiv.org/abs/2011.13456), 2021 — continuous time, the reverse SDE, and the probability-flow ODE sharing its marginals.
+- Song, Meng and Ermon, [*Denoising Diffusion Implicit Models*](https://arxiv.org/abs/2010.02502), 2021 — non-Markovian forward processes with the same training objective, and a deterministic sampler as a special case.
+- Karras et al., [*Elucidating the Design Space of Diffusion-Based Generative Models*](https://arxiv.org/abs/2206.00364), 2022 — the paper this chapter's framing owes most to: separating path, preconditioning, training and sampling into separable design choices.
+- Lipman et al., [*Flow Matching for Generative Modeling*](https://arxiv.org/abs/2210.02747), 2023 — simulation-free regression of a vector field over general Gaussian paths, including diffusion paths.
+- Liu, Gong and Liu, [*Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow*](https://arxiv.org/abs/2209.03003), 2023 — straight interpolants and recursive rectification for increasingly straight flows.
+- Albergo, Boffi and Vanden-Eijnden, [*Stochastic Interpolants: A Unifying Framework for Flows and Diffusions*](https://arxiv.org/abs/2303.08797), 2023 — deterministic transport and stochastic diffusion under one construction.
