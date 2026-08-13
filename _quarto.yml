@@ -14,10 +14,11 @@ website:
   navbar:
     left:
       - fundamentals.qmd
-      - agentic.qmd
-      - architectures.qmd
       - llm-systems.qmd
       - generative.qmd
+      - world-models.qmd
+      - architectures.qmd
+      - agentic.qmd
     right:
       - about.qmd
       - text: Portfolio

@@ -1,0 +1,16 @@
+---
+title: "🌍 World Models"
+page-layout: full
+title-block-banner: true
+---
+
+Models that predict how the world evolves, not just what a single frame looks like.
+
+::: {.grid .home-cards}
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### [🎥 Video Generation](notes/world-models/index.qmd)
+Frame-by-frame plausibility isn't the same as a coherent trajectory - why per-frame models fail at video, and what actually has to couple frames together.
+:::
+
+:::

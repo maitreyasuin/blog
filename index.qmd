@@ -34,8 +34,18 @@ Tensors, optimization, classical ML, and training loops - the building blocks be
 :::
 
 ::: {.g-col-12 .g-col-md-6 .home-card}
-### 🤖 [Agentic AI](agentic.qmd)
-Agents and evals - building things that act, and measuring whether they act well.
+### ⚙️ [LLM Systems](llm-systems.qmd)
+Inference, serving, post-training, evaluation, and scaling — how modern LLMs are built, optimized, and deployed.
+:::
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### 🎨 [Generative](generative.qmd)
+Diffusion, GANs, and the models built to generate rather than just predict.
+:::
+
+::: {.g-col-12 .g-col-md-6 .home-card}
+### 🌍 [World Models](world-models.qmd)
+Models that predict how the world evolves, not just what a single frame looks like.
 :::
 
 ::: {.g-col-12 .g-col-md-6 .home-card}
@@ -44,13 +54,8 @@ Attention, transformers, and the model architectures everything else is built fr
 :::
 
 ::: {.g-col-12 .g-col-md-6 .home-card}
-### ⚙️ [LLM Systems](llm-systems.qmd)
-Inference, serving, post-training, evaluation, and scaling — how modern LLMs are built, optimized, and deployed.
-:::
-
-::: {.g-col-12 .g-col-md-6 .home-card}
-### 🎨 [Generative](generative.qmd)
-Diffusion, GANs, and the models built to generate rather than just predict.
+### 🤖 [Agentic AI](agentic.qmd)
+Agents and evals - building things that act, and measuring whether they act well.
 :::
 
 :::
