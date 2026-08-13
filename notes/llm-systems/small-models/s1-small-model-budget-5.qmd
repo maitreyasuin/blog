@@ -1,0 +1,1072 @@
+---
+title: "A Small Model Is a Budget, Not a Parameter Count"
+description: "At small scale, parameter count hides the decisions that determine the model you actually deploy: vocabulary, KV state, depth, width, and active versus resident weights. This post derives those budgets from scratch, measures the tokenizer trade-off, and benchmarks equal-size models with a real KV-cached decode path."
+categories: [llm-systems, small-models, architecture]
+date: 2026-10-22
+depth: "Deep dive"
+format:
+  html:
+    toc: true
+    code-fold: false
+execute:
+  freeze: auto
+---
+
+"A 135M model" is not a deployment specification.
+
+It tells you how many learned scalars exist. It does **not** tell you where they were spent, how much state accumulates for every token in the context, or how many serial stages every generated token has to cross.
+
+At small scale, those omissions matter. A vocabulary matrix can consume half the model. Changing the number of KV heads can change cache size by multiples without changing the hidden width. Two models with essentially the same parameter count can put very different amounts of work on the critical path of autoregressive decoding.
+
+That is the theme of this chapter: **treat the parameter count as a budget, then ask where the budget went.**
+
+We will keep three ledgers separate as we go:
+
+1. **weights** — what has to be trained and stored,
+2. **per-token state** — especially the KV cache that grows with context,
+3. **runtime shape** — how the work is arranged into serial stages and hardware-facing matrix shapes.
+
+Mixing those ledgers is how otherwise sensible architectural arguments go wrong.
+
+> **TL;DR** — Start with the budget equation. At `V = 128,256` and `d = 576`, a tied vocabulary matrix alone is **54.7%** of a 135M-parameter budget; changing `n_kv` from 9 to 1 cuts the KV cache for the same model width by **9×**. A larger vocabulary then gives some of that cost back by shortening the sequence, but not for free: it also makes the output projection larger. Finally, equal-size depth/width variants separate in real KV-cached decode latency even though the parameter count barely moves. The count is useful. The allocation is what determines the machine.
+
+The experiments are deliberately CPU-sized. Exact timings are hardware-dependent; the code prints the numbers for the machine that actually executes the post.
+
+```{python}
+import collections
+import math
+import os
+import re
+import statistics
+import sysconfig
+import time
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+torch.manual_seed(0)
+print("torch", torch.__version__)
+```
+
+---
+
+# Act I — start with the ledger
+
+## What exactly are we counting?
+
+Before benchmarking anything, count the model.
+
+Take a decoder-only transformer with:
+
+- model width `d`,
+- `L` transformer blocks,
+- `n_q` query heads,
+- `n_kv` key/value heads,
+- head dimension `d_h = d / n_q`,
+- a SwiGLU feed-forward network of width `d_ff`,
+- one **tied** input/output vocabulary matrix of shape `V × d`.
+
+I will use bias-free linear layers below. The compact formula also omits the small RMSNorm scale vectors and assumes no learned positional embedding, so treat it as a budget equation rather than an exact `sum(p.numel())`.
+
+### Attention first
+
+The query projection has shape
+
+$$
+W_Q \in \mathbb{R}^{d \times (n_q d_h)}.
+$$
+
+Because `n_q d_h = d`, it contains `d²` parameters.
+
+The output projection is another `d²`.
+
+Keys and values are where the design freedom is. In ordinary multi-head attention every query head gets its own key/value head, so `n_kv = n_q`. Grouped-query attention lets several query heads *share* one key/value head, and multi-query attention takes that to its limit with `n_kv = 1`. The parameter saving is modest; the cache and memory-bandwidth savings are much larger, which is the main systems motivation — and it is why `n_kv` deserves its own symbol rather than being folded into `n_q`.
+
+Each K/V matrix has shape
+
+$$
+W_K, W_V \in \mathbb{R}^{d \times (n_{kv}d_h)}.
+$$
+
+Define
+
+$$
+r = \frac{n_{kv}}{n_q}.
+$$
+
+Since `n_kv d_h = r d`, each K/V matrix has `r d²` parameters. Therefore
+
+$$
+P_{\text{attn, layer}}
+= d^2 + d^2 + r d^2 + r d^2
+= 2d^2(1+r).
+$$
+
+A SwiGLU MLP has three matrices — gate, up, and down — giving
+
+$$
+P_{\text{MLP, layer}} = 3 d\,d_{\mathrm{ff}}.
+$$
+
+Which raises the question of what `d_ff` should be, and explains a constant that otherwise looks arbitrary. A conventional two-matrix feed-forward network at the usual width `4d` costs
+
+$$
+d(4d) + (4d)d = 8d^2.
+$$
+
+SwiGLU has three matrices instead of two, so matching that budget means
+
+$$
+3 d\, d_{\mathrm{ff}} = 8 d^2 \quad\Longrightarrow\quad d_{\mathrm{ff}} = \tfrac{8}{3} d.
+$$
+
+That is the origin of the familiar `8d/3` rule: it gives a three-matrix SwiGLU roughly the same parameter budget as a conventional two-matrix `4d` FFN. Real architectures often round it to something kernel-friendly or move away from it deliberately, so treat it as a reference point rather than a law — but when you see a number near `8d/3` in a config, this is why.
+
+Put the blocks and tied vocabulary matrix together:
+
+$$
+\boxed{
+P \approx Vd
++ L\left[2d^2(1+r)+3d\,d_{\mathrm{ff}}\right]
+},
+\qquad
+r=\frac{n_{kv}}{n_q}.
+$$
+
+A compact derivation is exactly where I like to write the explicit count once. It catches missing factors before they get copied into every later spreadsheet.
+
+```{python}
+d, n_q, n_kv = 576, 9, 3
+d_h = d // n_q
+r = n_kv / n_q
+
+explicit = (
+    d * (n_q * d_h)        # W_Q
+    + d * (n_kv * d_h)     # W_K
+    + d * (n_kv * d_h)     # W_V
+    + (n_q * d_h) * d      # W_O
+)
+formula = 2 * d * d * (1 + r)
+
+print(f"head dimension                    : {d_h}")
+print(f"explicit Q + K + V + O parameters : {explicit:,}")
+print(f"formula  2d²(1+r)                 : {int(formula):,}")
+print(f"match                              : {explicit == int(formula)}")
+```
+
+There is a second ledger that parameter count does not show at all.
+
+## The KV cache is state, not weights
+
+During autoregressive generation we do not want to recompute keys and values for the whole prefix at every step. Each layer therefore stores the previous keys and values.
+
+For one token, one layer stores
+
+- `n_kv × d_h` values for K,
+- `n_kv × d_h` values for V.
+
+Across all layers:
+
+$$
+\boxed{
+\text{KV bytes/token}
+=
+2L\,n_{kv}\,d_h\,b
+}
+$$
+
+where `b` is bytes per stored scalar.
+
+That equation is worth reading literally. `n_q` determines how many query heads do work **now**. `n_kv` determines how many K/V streams survive into the cache for **every future token**.
+
+Here is the same `d = 576`, `L = 30` model under multi-head attention, GQA, and MQA. We hold `d_h = 64` fixed and change only how many distinct K/V heads are stored.
+
+```{python}
+L, d, n_q, d_h = 30, 576, 9, 64
+BYTES = 2  # bf16/fp16-sized cache
+
+print(f"{'attention':<10}{'n_kv':>6}{'KV KiB/token':>15}")
+for name, n_kv_ in [("MHA", 9), ("GQA", 3), ("MQA", 1)]:
+    kv_bytes = 2 * L * n_kv_ * d_h * BYTES
+    print(f"{name:<10}{n_kv_:>6}{kv_bytes/1024:>15.1f}")
+```
+
+Same hidden width. Same number of query heads. **9×** between the two ends of the cache ledger.
+
+This is the first practical lesson: if a long-context deployment is memory-constrained, `n_kv` is not a cosmetic attention hyperparameter.
+
+---
+
+# Act II — the tokenizer spends from more than one budget
+
+## The vocabulary matrix is not small-model overhead
+
+Now look at the `Vd` term.
+
+It is a flat charge: you pay it before adding a single transformer block. With tied embeddings, those parameters serve two roles:
+
+1. lookup rows to turn token IDs into hidden vectors,
+2. the output projection that turns the final hidden vector back into `V` logits.
+
+Weight tying saves parameters; it does **not** remove the `d × V` output computation at decode time. Keep that distinction in mind — it matters later.
+
+First, just look at capacity.
+
+```{python}
+def budget(V, d, L, n_q, n_kv, d_ff, tied=True):
+    """Approximate parameter ledger.
+
+    Omits RMSNorm scales and any router/positional parameters. Linear layers in
+    the toy models are bias-free, so no bias terms are missing.
+    """
+    vocab = V * d * (1 if tied else 2)
+    blocks = L * (
+        2 * d * d * (1 + n_kv / n_q)
+        + 3 * d * d_ff
+    )
+    return vocab, blocks, vocab + blocks
+
+
+TARGET = 135e6
+d, n_q, n_kv, d_ff = 576, 9, 3, 1536
+per_layer = 2 * d * d * (1 + n_kv / n_q) + 3 * d * d_ff
+
+print(f"budget {TARGET/1e6:.0f}M, d={d}, one block costs {per_layer/1e6:.2f}M\n")
+print(f"{'vocabulary':>12}{'V×d':>12}{'budget %':>11}{'left for blocks':>18}{'whole blocks':>14}")
+
+for V_ in [8_192, 32_000, 50_257, 128_256, 202_048]:
+    vocab = V_ * d
+    left = TARGET - vocab
+    print(
+        f"{V_:>12,}"
+        f"{vocab/1e6:>11.1f}M"
+        f"{vocab/TARGET:>10.1%}"
+        f"{left/1e6:>17.1f}M"
+        f"{max(0, int(left // per_layer)):>14}"
+    )
+```
+
+
+The 32k-to-128k move is the important row pair. At this width:
+
+- `V = 32,000` spends 13.7% of the 135M budget on the tied vocabulary matrix;
+- `V = 128,256` spends 54.7%;
+- the remaining block budget falls by enough to remove **fifteen complete transformer blocks**.
+
+At `V = 202,048`, only about 18.6M parameters remain for the transformer stack — five blocks with this configuration. That is still a language model; it is simply an extremely shallow allocation of a 135M budget.
+
+The effect gets smaller as the model gets larger, but it does not magically disappear. For a concrete comparison, if a 7B model had `d = 4096`, the same tied 32k and 128k matrices would be about 131M and 525M parameters — roughly 1.9% and 7.5% of 7B. The *fraction* is much smaller than in the 135M example.
+
+### What if we untie input and output embeddings?
+
+At the small-model end, this can consume the budget before the transformer gets a chance.
+
+```{python}
+V, d = 128_256, 576
+one = V * d
+
+print(f"one V×d matrix             : {one/1e6:>7.1f}M")
+print(f"two untied matrices        : {2*one/1e6:>7.1f}M")
+print(f"reference model budget     : {135:>7.1f}M")
+print(f"two matrices exceed budget : {2*one > 135e6}")
+```
+
+The precise statement matters. Untying does not make the architecture impossible; it makes it **larger**. Starting from the tied configuration, the second matrix adds another 73.9M parameters. If 135M is a hard storage or training budget, that choice is simply unavailable unless something else shrinks.
+
+That is why tokenization is an architectural decision in a small model.
+
+But that is only one side of it.
+
+## A larger vocabulary buys shorter sequences
+
+The obvious response is: make `V` small.
+
+That saves weights, but usually makes the same text longer in tokens. Longer sequences cost prefill work, attention work, and KV cache. So we need to measure the other side of the trade instead of arguing about it abstractly.
+
+We can build enough BPE from scratch to see the effect.
+
+### First, choose a corpus
+
+For a self-contained experiment, use Python source code already installed with the interpreter:
+
+```{python}
+def load_corpus(n_chars=400_000):
+    """Collect a deterministic-sized slice of local Python stdlib source."""
+    root = sysconfig.get_paths()["stdlib"]
+    parts, total = [], 0
+
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames.sort()          # os.walk order is filesystem-dependent; pin it
+        for filename in sorted(files):
+            if not filename.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, filename)
+            try:
+                piece = open(path, encoding="utf-8").read()
+            except (OSError, UnicodeError):
+                continue
+
+            parts.append(piece)
+            total += len(piece)
+
+        if total > n_chars * 1.5:
+            break
+
+    return "\n".join(parts)[:n_chars]
+
+
+corpus = load_corpus()
+print(f"corpus: {len(corpus)/1e3:.0f}k characters of Python source")
+```
+
+The exact source files depend on the Python installation, so the exact compression numbers are not a benchmark. The controlled variable is the vocabulary size **within one render**.
+
+### Then build a minimal BPE
+
+Production tokenizers have more machinery: normalization, a pre-tokenizer, special tokens, byte fallback, and carefully chosen training data. We do not need all of that to isolate the vocabulary/compression trade-off.
+
+One detail *does* matter: every input character must be represented.
+
+A tempting shortcut is `text.split(" ")`. Do not do that here. The spaces disappear from the symbol sequences, and if you still divide `len(text)` by the resulting token count, the reported characters/token is inflated.
+
+Instead, split into whitespace runs and non-whitespace runs. Every character remains in exactly one piece, then BPE merges only within a piece.
+
+```{python}
+def train_bpe(text, vocab_size):
+    """A small character-level BPE with incremental pair counts.
+
+    Pretokenization preserves *all* characters:
+      "x = 10\n" -> ["x", " ", "=", " ", "10", "\n"]
+
+    BPE then repeatedly merges the most frequent adjacent symbol pair inside
+    each piece. We stop if the best remaining pair occurs fewer than twice.
+    """
+
+    # Counter compresses repeated pieces, so we do not process every occurrence
+    # separately during every merge.
+    pieces = collections.Counter(re.findall(r"\s+|[^\s]+", text))
+    seqs = {piece: tuple(piece) for piece in pieces}
+    vocab = {ch for piece in pieces for ch in piece}
+
+    # pairs[p] = corpus frequency of adjacent pair p.
+    # where[p] = unique pieces whose symbol sequence currently contains p.
+    pairs = collections.Counter()
+    where = collections.defaultdict(set)
+
+    for piece, count in pieces.items():
+        symbols = seqs[piece]
+        for i in range(len(symbols) - 1):
+            pair = (symbols[i], symbols[i + 1])
+            pairs[pair] += count
+            where[pair].add(piece)
+
+    while len(vocab) < vocab_size and pairs:
+        best = max(pairs, key=pairs.get)
+
+        # This is our choice, not a law of BPE: do not spend vocabulary on a
+        # merge seen only once in the training corpus.
+        if pairs[best] < 2:
+            break
+
+        merged_symbol = best[0] + best[1]
+        vocab.add(merged_symbol)
+
+        # Only pieces containing `best` can change. This inverted index is what
+        # avoids rescanning the entire corpus after every merge.
+        for piece in list(where[best]):
+            symbols = seqs[piece]
+            count = pieces[piece]
+
+            # 1) retract this piece's old pair contributions
+            for i in range(len(symbols) - 1):
+                pair = (symbols[i], symbols[i + 1])
+                pairs[pair] -= count
+                if pairs[pair] <= 0:
+                    pairs.pop(pair, None)
+                    where.pop(pair, None)
+                else:
+                    where[pair].discard(piece)
+
+            # 2) apply the selected merge left-to-right
+            out, i = [], 0
+            while i < len(symbols):
+                if i < len(symbols) - 1 and (symbols[i], symbols[i + 1]) == best:
+                    out.append(merged_symbol)
+                    i += 2
+                else:
+                    out.append(symbols[i])
+                    i += 1
+
+            symbols = tuple(out)
+            seqs[piece] = symbols
+
+            # 3) add the new pair contributions back
+            for i in range(len(symbols) - 1):
+                pair = (symbols[i], symbols[i + 1])
+                pairs[pair] += count
+                where[pair].add(piece)
+
+        pairs.pop(best, None)
+        where.pop(best, None)
+
+    n_tokens = sum(len(seqs[piece]) * count for piece, count in pieces.items())
+    chars_per_token = len(text) / n_tokens
+    return len(vocab), chars_per_token
+```
+
+The algorithm is simple; the implementation detail worth remembering is the `where` index. A naive trainer recounts every pair in the entire corpus after every merge. Here, a merge only revisits pieces that actually contained the selected pair.
+
+Now vary only the requested vocabulary:
+
+```{python}
+t0 = time.time()
+compression = {}
+
+for requested_V in [256, 512, 1024, 2048, 4096, 8192]:
+    actual_V, cpt = train_bpe(corpus, requested_V)
+    compression[actual_V] = cpt
+    print(
+        f"requested V = {requested_V:>5}   "
+        f"actual V = {actual_V:>5}   "
+        f"{cpt:.3f} characters/token"
+    )
+
+print(f"\n[{time.time() - t0:.1f}s]")
+```
+
+The exact numbers depend on the local stdlib corpus, but the direction is the point: a larger vocabulary spends more parameters to represent the same character stream with fewer tokens.
+
+Why does that matter beyond the cache? If a fixed piece of text becomes `N` tokens, the projection/MLP work is roughly linear in `N`, while the attention-score part of a full prefill grows roughly with `N²`. The exact runtime is kernel- and hardware-dependent, but token count enters more than one term of the serving bill.
+
+There is also a useful failure mode hidden here. If we ask this small corpus for a much larger vocabulary, our `frequency >= 2` rule eventually refuses to add more merges:
+
+```{python}
+requested = 16_384
+actual, cpt = train_bpe(corpus, requested)
+print(f"requested vocabulary : {requested:,}")
+print(f"actual vocabulary    : {actual:,}")
+print(f"characters/token     : {cpt:.3f}")
+```
+
+Do not turn that into the false rule that "BPE cannot build a larger vocabulary." A production trainer can keep adding rare or even one-off merges if configured to do so. What the early stop tells us is narrower and more useful: **the corpus no longer provides repeated evidence for spending additional vocabulary under our rule.**
+
+## The vocabulary decision hits two ledgers — and latency sees both
+
+Now hold the transformer stack fixed and convert the sequence-length effect into memory.
+
+```{python}
+d, L, n_q, n_kv, d_ff = 576, 30, 9, 3, 1536
+d_h = d // n_q
+BYTES = 2  # bf16-sized weights/cache for this accounting example
+
+kv_per_token = 2 * L * n_kv * d_h * BYTES
+_, block_params, _ = budget(0, d, L, n_q, n_kv, d_ff)
+
+print(f"KV cache : {kv_per_token:,} bytes/token = {kv_per_token/1024:.1f} KiB/token")
+print(f"blocks   : {block_params/1e6:.1f}M parameters = "
+      f"{block_params * BYTES / 1e6:.0f} MB\n")
+
+for chars in [20_000, 2_000_000]:
+    print(f"context: {chars:,} characters")
+    print(
+        f"  {'V':>7}{'chars/tok':>11}{'tokens':>10}"
+        f"{'V×d MB':>10}{'KV MB':>11}{'accounted':>11}"
+    )
+
+    for V_, cpt in compression.items():
+        tokens = chars / cpt
+        vocab_mb = V_ * d * BYTES / 1e6
+        kv_mb = tokens * kv_per_token / 1e6
+        blocks_mb = block_params * BYTES / 1e6
+
+        print(
+            f"  {V_:>7}"
+            f"{cpt:>11.3f}"
+            f"{tokens:>10.0f}"
+            f"{vocab_mb:>10.1f}"
+            f"{kv_mb:>11.1f}"
+            f"{vocab_mb + kv_mb + blocks_mb:>12.1f}"
+        )
+    print()
+```
+
+The last column is named `accounted` rather than `total` deliberately. It is exactly three terms — block weights, vocabulary weights, KV cache — and nothing else. Activation buffers, attention workspaces, allocator fragmentation and framework overhead are all real and all absent. Measure a subset, name the subset; a column labelled "total" invites the reader to compare it against a number from `nvidia-smi` and conclude that the arithmetic is wrong.
+
+For long contexts the cache dominates this particular configuration, so paying a few extra megabytes for the vocabulary matrix can save far more memory by reducing the number of cached tokens.
+
+But "larger vocabulary wins" is still too broad. There is a crossover.
+
+The extra vocabulary weight is paid once. KV savings accumulate with every character of context. For the smallest and largest vocabulary in our table, solve for the context length where those two terms are equal:
+
+```{python}
+small_V = min(compression)
+large_V = max(compression)
+
+small_cpt = compression[small_V]
+large_cpt = compression[large_V]
+
+extra_vocab_bytes = (large_V - small_V) * d * BYTES
+kv_bytes_saved_per_char = kv_per_token * (1 / small_cpt - 1 / large_cpt)
+crossover_chars = extra_vocab_bytes / kv_bytes_saved_per_char
+
+print(f"compare V={small_V} -> V={large_V}")
+print(f"extra vocabulary memory : {extra_vocab_bytes/1e6:.2f} MB")
+print(f"KV saved per character  : {kv_bytes_saved_per_char/1024:.2f} KiB")
+print(f"memory crossover        : about {crossover_chars:,.0f} characters")
+```
+
+That is a much better way to reason about the choice than declaring one vocabulary "efficient."
+
+And memory is still not latency.
+
+A larger vocabulary has two opposing runtime effects:
+
+- **fewer tokens** can reduce prefill work, attention work, KV traffic, and the number of autoregressive steps needed to emit a fixed amount of text;
+- **more logits** make the tied output projection `h @ Eᵀ`, with `E ∈ R^{V×d}`, larger at every generated token.
+
+So the vocabulary choice has to be made against the workload. Long-context memory may favor compression aggressively. A tight per-token decode target may care about the vocabulary projection. We will come back to that projection after the next experiment.
+
+---
+
+# Act III — same parameter count, different critical path
+
+### And memory is still not latency
+
+One consequence has been waiting since the first table in this Act, and it is the moment the parameter ledger reaches across into the runtime one.
+
+```{python}
+V_big = 128_256
+head = V_big * d
+block_budget = TARGET - head
+whole_blocks = int(block_budget // per_layer)
+
+print(f"vocabulary matrix   : {head/1e6:>6.1f}M weights")
+print(f"budget for blocks   : {block_budget/1e6:>6.1f}M weights")
+print(f"ratio               : {head/block_budget:>6.2f}x")
+print(f"blocks actually fit : {whole_blocks}, using {whole_blocks*per_layer/1e6:.1f}M")
+```
+
+Because the embedding is tied, that same matrix is the output projection. So at every decode step this model performs one `d × V` matrix-vector product against a matrix **larger than the entire budget left for transformer blocks**.
+
+Which inverts how it looked a moment ago. In the parameter ledger the vocabulary matrix reads as overhead — a lookup table crowding out real layers. For one decoded token it is the largest individual learned dense projection in the model. Both descriptions are of the same 73.9M numbers.
+
+Be precise about the scope of that: it is a claim about *dense learned projections*. Attention against the cached prefix is separate work that grows with context length, and at long enough context it dominates everything. What the arithmetic above establishes is that the matrix you were about to dismiss as embedding overhead is the biggest single weight matrix in the decode path.
+
+Weight tying halves the storage. It does not remove the computation, because you still have to produce a logit for every token in the vocabulary before you can sample one.
+
+So follow one vocabulary decision through all three ledgers. In Act II, moving from a 32k vocabulary to a 128k one was a **weight tax** — at this width it cost fifteen complete transformer blocks. The BPE experiment then showed what that buys: **shorter sequences**, with a calculable context length beyond which the KV savings repay the extra vocabulary memory under this model, corpus and accounting. And now the same matrix appears a third time as **computation**, once per generated token, whatever the sequence length.
+
+Three ledgers, one decision, and no vocabulary size that is optimal in all of them. That is the pattern. Now hold the weight budget fixed and change the shape of the transformer itself.
+
+## Hold the budget fixed and move it between depth and width
+
+The block term is roughly quadratic in `d`:
+
+$$
+P_{\text{blocks}} \propto Ld^2.
+$$
+
+So at approximately fixed parameters, making a model narrower lets us make it deeper.
+
+That does **not** imply equal runtime.
+
+Depth creates more sequential stages. Width creates more work inside each stage, which hardware can often exploit in parallel. The trade-off is hardware-dependent, so the right experiment is not another parameter table — it is a timing measurement.
+
+First construct four roughly equal-size shapes.
+
+For this timing experiment I use a smaller 45M budget and `V = 8192` so the CPU run stays practical. I also hold two easy-to-miss confounders fixed:
+
+- head dimension is always `64`,
+- `n_kv / n_q = 1/2` for every shape.
+
+If we kept the number of heads fixed while changing `d`, head dimension would change too, and part of the latency difference could simply be kernel shape.
+
+```{python}
+V_BENCH = 8_192
+TARGET_BENCH = 45e6
+
+
+def rounded_swiglu_width(d):
+    # A 3-matrix SwiGLU at 8d/3 has approximately the same parameter count
+    # as a conventional 2-matrix FFN at 4d. Round for kernel-friendly shapes.
+    return int(round((8 * d / 3) / 64)) * 64
+
+
+def nearest_layers(V, d, target, n_q, n_kv, d_ff):
+    return min(
+        range(2, 80),
+        key=lambda L: abs(budget(V, d, L, n_q, n_kv, d_ff)[2] - target),
+    )
+
+
+shape_specs = [
+    ("wide, shallow", 768, 12, 6),
+    ("balanced", 640, 10, 5),
+    ("thin, deep", 512, 8, 4),
+    ("very thin, deep", 384, 6, 3),
+]
+
+shapes = []
+
+print(
+    f"{'shape':<18}{'d':>6}{'heads':>8}{'kv':>6}"
+    f"{'d_ff':>8}{'L':>5}{'params':>11}{'KV KiB/tok':>13}"
+)
+
+for name, d_, n_q_, n_kv_ in shape_specs:
+    assert d_ // n_q_ == 64
+    assert n_q_ / n_kv_ == 2
+
+    d_ff_ = rounded_swiglu_width(d_)
+    L_ = nearest_layers(
+        V_BENCH, d_, TARGET_BENCH, n_q_, n_kv_, d_ff_
+    )
+    p = budget(V_BENCH, d_, L_, n_q_, n_kv_, d_ff_)[2]
+
+    shapes.append((name, d_, L_, n_q_, n_kv_, d_ff_, p))
+
+    kv_kib = 2 * L_ * n_kv_ * 64 * 2 / 1024      # the Act I formula, per shape
+
+    print(
+        f"{name:<18}{d_:>6}{n_q_:>8}{n_kv_:>6}"
+        f"{d_ff_:>8}{L_:>5}{p/1e6:>10.1f}M{kv_kib:>13.1f}"
+    )
+```
+
+Look at the last column before going further, because it undermines the phrase "everything else held fixed" and it is worth being honest about.
+
+Head dimension is fixed at 64 and the GQA ratio at 2, so those are genuinely controlled. But `n_kv` still falls as `d` shrinks — six K/V heads at `d = 768`, three at `d = 384` — while `L` rises from 6 to 26. Run those through `2·L·n_kv·d_h` and **the per-token cache grows from 9.0 to 19.5 KiB, a factor of 2.17.**
+
+So this is not an isolated measurement of "what does adding depth cost." Equal parameter count does not hold the state ledger fixed, and at any given cache length the deeper models are also doing more attention work and moving more cache traffic per token.
+
+That is not a flaw in the experiment; it is the point arriving early. These are four whole architectural shapes under *roughly* the same weight budget — and "roughly" is doing real work, since the counts span 44.1M to 46.2M rather than landing on a single number. Vocabulary, head dimension and GQA ratio are deliberately controlled. Even so, the state ledger moves: weights stay near 45M while KV per token more than doubles. That is precisely why a parameter count under-determines the model.
+
+This is an easy place to write a benchmark that looks right but measures the wrong thing.
+
+Calling
+
+```python
+model(torch.randint(0, V, (1, 1)))
+```
+
+is a one-token forward pass. It is **not** autoregressive decode after a prompt unless the model also reads the K/V state produced by that prompt.
+
+So the toy model below has two explicit paths:
+
+- `prefill(...)` processes the whole prompt causally and writes K/V into a cache;
+- `decode_at(...)` processes one new token, appends its K/V at a fixed cache position, and attends to all cached tokens.
+
+The cache is preallocated. A simple `torch.cat([old_k, new_k], dim=2)` is convenient for a demo, but it copies the prefix on every step and would contaminate the latency measurement with an allocation/copy pattern a production cache avoids.
+
+```{python}
+#| code-fold: true
+#| code-summary: "Minimal GQA decoder with an explicit preallocated KV cache"
+
+class Block(nn.Module):
+    def __init__(self, d, n_q, n_kv, d_ff):
+        super().__init__()
+        assert d % n_q == 0
+        assert n_q % n_kv == 0
+
+        self.n_q = n_q
+        self.n_kv = n_kv
+        self.d_h = d // n_q
+
+        self.wq = nn.Linear(d, n_q * self.d_h, bias=False)
+        self.wk = nn.Linear(d, n_kv * self.d_h, bias=False)
+        self.wv = nn.Linear(d, n_kv * self.d_h, bias=False)
+        self.wo = nn.Linear(n_q * self.d_h, d, bias=False)
+
+        self.gate = nn.Linear(d, d_ff, bias=False)
+        self.up = nn.Linear(d, d_ff, bias=False)
+        self.down = nn.Linear(d_ff, d, bias=False)
+
+        self.n1 = nn.RMSNorm(d)
+        self.n2 = nn.RMSNorm(d)
+
+    def _qkv(self, h):
+        """[B,T,d] -> Q:[B,n_q,T,d_h], K/V:[B,n_kv,T,d_h]."""
+        B, T, _ = h.shape
+
+        q = (
+            self.wq(h)
+            .view(B, T, self.n_q, self.d_h)
+            .transpose(1, 2)
+        )
+        k = (
+            self.wk(h)
+            .view(B, T, self.n_kv, self.d_h)
+            .transpose(1, 2)
+        )
+        v = (
+            self.wv(h)
+            .view(B, T, self.n_kv, self.d_h)
+            .transpose(1, 2)
+        )
+        return q, k, v
+
+    def prefill(self, x, k_cache, v_cache):
+        """Process the prompt and populate cache positions [0:T)."""
+        B, T, _ = x.shape
+
+        h = self.n1(x)
+        q, k, v = self._qkv(h)
+
+        # Cache the *unrepeated* GQA K/V heads. This is the memory counted by
+        # 2 * L * n_kv * d_h bytes/token.
+        k_cache[:, :, :T].copy_(k)
+        v_cache[:, :, :T].copy_(v)
+
+        a = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            enable_gqa=True,
+        )
+        x = x + self.wo(a.transpose(1, 2).reshape(B, T, -1))
+
+        h = self.n2(x)
+        x = x + self.down(F.silu(self.gate(h)) * self.up(h))
+        return x
+
+    def decode_at(self, x, k_cache, v_cache, pos):
+        """Decode one token at cache position `pos`.
+
+        x has T=1. The cache already contains only past positions [0:pos), so
+        after writing the current K/V there are no future keys to mask.
+        """
+        B, T, _ = x.shape
+        assert T == 1
+
+        h = self.n1(x)
+        q, k, v = self._qkv(h)
+
+        k_cache[:, :, pos:pos + 1].copy_(k)
+        v_cache[:, :, pos:pos + 1].copy_(v)
+
+        # Important incremental-decoding detail:
+        # q length is 1 while k/v length is pos+1. Since the slice contains
+        # only past+current keys, is_causal=False is correct here.
+        a = F.scaled_dot_product_attention(
+            q,
+            k_cache[:, :, :pos + 1],
+            v_cache[:, :, :pos + 1],
+            is_causal=False,
+            enable_gqa=True,
+        )
+        x = x + self.wo(a.transpose(1, 2).reshape(B, 1, -1))
+
+        h = self.n2(x)
+        x = x + self.down(F.silu(self.gate(h)) * self.up(h))
+        return x
+
+
+class LM(nn.Module):
+    def __init__(self, V, d, L, n_q, n_kv, d_ff):
+        super().__init__()
+
+        self.emb = nn.Embedding(V, d)
+        self.blocks = nn.ModuleList(
+            [Block(d, n_q, n_kv, d_ff) for _ in range(L)]
+        )
+        self.norm = nn.RMSNorm(d)
+
+    def make_cache(self, batch_size, max_seq_len):
+        caches = []
+        dtype = self.emb.weight.dtype
+        device = self.emb.weight.device
+
+        for block in self.blocks:
+            shape = (
+                batch_size,
+                block.n_kv,
+                max_seq_len,
+                block.d_h,
+            )
+            k_cache = torch.empty(shape, dtype=dtype, device=device)
+            v_cache = torch.empty_like(k_cache)
+            caches.append((k_cache, v_cache))
+
+        return caches
+
+    def prefill(self, idx, caches):
+        h = self.emb(idx)
+
+        for block, (k_cache, v_cache) in zip(self.blocks, caches):
+            h = block.prefill(h, k_cache, v_cache)
+
+        # Serving needs the next-token logits, not a V-dimensional logit vector
+        # for every prompt position.
+        h_last = self.norm(h[:, -1:])
+        return h_last @ self.emb.weight.T
+
+    def decode_at(self, idx, caches, pos):
+        h = self.emb(idx)
+
+        for block, (k_cache, v_cache) in zip(self.blocks, caches):
+            h = block.decode_at(h, k_cache, v_cache, pos)
+
+        return self.norm(h) @ self.emb.weight.T
+```
+
+Two details in that code are easy to miss in a larger inference engine.
+
+The `enable_gqa=True` argument requires a recent PyTorch build with SDPA GQA support; the post prints the installed version at the top so a rerun is easy to diagnose.
+
+First, GQA does **not** mean storing `n_q` copies of K/V. The cache keeps only `n_kv` heads. The attention kernel handles the grouping.
+
+Second, `is_causal=True` is right for square prompt self-attention, but incremental decode is different: our one query is allowed to see every key in the cache slice because that slice contains no future positions.
+
+This timing harness now measures those two paths separately.
+
+```{python}
+torch.set_num_threads(4)
+
+PROMPT_LEN = 256
+prompt = torch.randint(0, V_BENCH, (1, PROMPT_LEN))
+next_token = torch.randint(0, V_BENCH, (1, 1))
+```
+
+Before timing anything, check that the cached path is *correct*. A KV cache is
+exactly the kind of code that runs, produces plausible numbers, and is quietly
+off by one — and then you have benchmarked the wrong function.
+
+The test: compute the next-token logits after consuming the same nine tokens in
+two different ways. First, prefill all nine at once and read the last position —
+the teacher-forced answer we trust. Second, prefill the first eight and feed the
+ninth through the cached decode path. Both have now consumed the identical
+prefix, so both must predict the tenth token identically.
+
+```{python}
+torch.manual_seed(0)
+probe = LM(V=500, d=64, L=3, n_q=4, n_kv=2, d_ff=128).eval()
+seq = torch.randint(0, 500, (1, 9))
+
+with torch.no_grad():
+    cache_a = probe.make_cache(batch_size=1, max_seq_len=16)
+    probe.prefill(seq[:, :8], cache_a)                     # positions 0..7
+    from_cache = probe.decode_at(seq[:, 8:9], cache_a, pos=8)
+
+    cache_b = probe.make_cache(batch_size=1, max_seq_len=16)
+    from_full = probe.prefill(seq, cache_b)[:, -1:]        # all 9 at once
+
+print(f"max abs difference : {(from_cache - from_full).abs().max():.3e}")
+print(f"logit scale        : {from_full.abs().max():.3f}")
+print(f"agree              : {torch.allclose(from_cache, from_full, atol=1e-4)}")
+```
+
+Agreement to a few parts in ten million against logits of order 60, which is
+ordinary float32 reassociation and not a bug. Now the measurement means
+something.
+
+```{python}
+def median_ms(fn, reps, warmup=2):
+    """Median latency; one scheduler hiccup should not become the result."""
+    for _ in range(warmup):
+        fn()
+
+    samples = []
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        fn()
+        samples.append((time.perf_counter() - t0) * 1000)
+
+    return statistics.median(samples)
+
+
+built = {}
+for name, d_, L_, n_q_, n_kv_, d_ff_, p in shapes:
+    model = LM(
+        V_BENCH, d_, L_, n_q_, n_kv_, d_ff_
+    ).eval()
+    cache = model.make_cache(batch_size=1, max_seq_len=PROMPT_LEN + 1)
+    built[name] = (model, cache, L_, p)
+
+pre_runs = {name: [] for name in built}
+dec_runs = {name: [] for name in built}
+
+with torch.no_grad():
+    # Interleave model order across rounds so slow thermal/scheduler drift is
+    # less likely to masquerade as an architecture difference.
+    items = list(built.items())
+    for round_idx in range(4):          # 4, not 2: the median of two values is
+                                        # just their midpoint, so the outer
+                                        # aggregation would have no robustness
+        # Genuinely alternate direction. Iterating the same order twice and
+        # calling it interleaving does not control for drift; it just averages
+        # two samples taken under the same conditions.
+        order = items if round_idx % 2 == 0 else list(reversed(items))
+        for name, (model, cache, L_, p) in order:
+            pre_runs[name].append(
+                median_ms(
+                    lambda m=model, c=cache: m.prefill(prompt, c),
+                    reps=2,
+                    warmup=1,
+                )
+            )
+
+            # Ensure cache positions [0:PROMPT_LEN) contain this prompt before
+            # timing a step at position PROMPT_LEN.
+            model.prefill(prompt, cache)
+
+            dec_runs[name].append(
+                median_ms(
+                    lambda m=model, c=cache: m.decode_at(
+                        next_token, c, PROMPT_LEN
+                    ),
+                    reps=10,
+                    warmup=2,
+                )
+            )
+
+print(
+    f"{'shape':<18}{'params':>10}{'L':>5}"
+    f"{'prefill':>12}{'cached decode':>15}"
+)
+
+rows = []
+for name, (model, cache, L_, p) in built.items():
+    pre = statistics.median(pre_runs[name])
+    dec = statistics.median(dec_runs[name])
+    rows.append((name, p, L_, pre, dec))
+
+    print(
+        f"{name:<18}{p/1e6:>9.1f}M{L_:>5}"
+        f"{pre:>10.1f} ms{dec:>12.2f} ms"
+    )
+
+fastest_pre = min(row[3] for row in rows)
+slowest_pre = max(row[3] for row in rows)
+fastest_dec = min(row[4] for row in rows)
+slowest_dec = max(row[4] for row in rows)
+
+print(f"\nprefill spread      : {slowest_pre / fastest_pre:.2f}x")
+print(f"cached-decode spread: {slowest_dec / fastest_dec:.2f}x")
+```
+
+Do not memorize the ratio printed by this machine. Read the mechanism.
+
+All four models are around 45M parameters, yet they do not have the same critical path. The deepest model has many more block boundaries and sequential dependencies. The widest model does more arithmetic inside each block, but presents larger matrix operations to the hardware.
+
+A better shorthand than "depth is slow, width is fast" is:
+
+> **Depth adds serial stages. Width adds more parallelizable work inside a stage.**
+
+How those two effects balance depends on kernels and hardware. That is exactly why parameter count cannot answer a latency question.
+
+There is also a quality trade-off. MobileLLM reports that, for its roughly 125M/350M experiments, deeper-and-thinner variants generally outperform wider-and-shallower variants at comparable parameter count. That is a useful empirical result — and it makes the systems trade-off more interesting, not less. The architecture that spends the budget best for quality need not be the one that meets a specific latency target.
+
+### What this benchmark still is not
+
+This is a deliberately small PyTorch-eager CPU benchmark. It has:
+
+- batch size 1,
+- a real preallocated KV cache,
+- no quantization,
+- no fused RoPE,
+- no paged KV allocator,
+- no continuous batching,
+- no compilation or hardware-specific inference engine.
+
+The model is also untrained; positional encoding is omitted because we are measuring shape, not language quality.
+
+Those are not footnotes to hide. They define what the experiment establishes: **equal parameter counts do not imply equal prefill or cached-decode latency, and the result has to be measured on the target stack.** The exact factor is not portable.
+
+---
+
+# Act IV — two more ways the count lies by omission
+
+## Active parameters are not resident parameters
+
+A mixture-of-experts model makes the word "size" ambiguous in another way.
+
+Suppose every layer contains `n_experts` SwiGLU experts but each token routes through only `top_k` of them. Ignoring the small router and norm parameters:
+
+- all expert weights must be **resident** somewhere,
+- only the selected experts are **active** for that token.
+
+```{python}
+def moe_budget(V, d, L, n_q, n_kv, d_ff, n_experts, top_k):
+    shared_attention = L * 2 * d * d * (1 + n_kv / n_q)
+    one_expert = 3 * d * d_ff
+
+    shared = V * d + shared_attention
+    active = shared + L * top_k * one_expert
+    resident = shared + L * n_experts * one_expert
+
+    return active, resident
+
+
+active, resident = moe_budget(
+    V=32_000,
+    d=768,
+    L=24,
+    n_q=12,
+    n_kv=4,
+    d_ff=2048,
+    n_experts=16,
+    top_k=2,
+)
+
+print(f"active-path parameters : {active/1e6:>8.1f}M")
+print(f"resident parameters    : {resident/1e6:>8.1f}M")
+print(f"resident / active      : {resident/active:>8.2f}x")
+```
+
+For this toy configuration, the active path touches about 289M parameters while roughly 1.87B parameters are resident — a **6.5×** gap.
+
+"Active parameters" is still only a compute proxy. An embedding lookup does not multiply through every vocabulary row, the tied output head does, routing has its own cost, and expert implementations differ. But the deployment point survives those details: sparse activation can reduce per-token expert compute without making the inactive expert weights disappear from memory.
+
+On a memory-constrained device, resident weights are therefore a first-class constraint unless you are willing to stream/offload experts and pay the systems cost that introduces.
+
+## Shape decides kernels too
+
+Depth and vocabulary are not the only hidden variables.
+
+Two configurations with similar parameter counts can behave differently because:
+
+- `d`, `d_ff`, or `d_h` align differently with kernel tile sizes,
+- a head configuration may or may not hit an optimized attention path,
+- quantization groups may fit one shape better than another,
+- the output projection may dominate one model but not another,
+- cache layout and batching strategy can change which operation is actually the bottleneck.
+
+That leads to the most practical rule in the chapter:
+
+> **Use parameter count to design the search space. Use the target inference stack to choose the configuration.**
+
+A parameter equation is a planning tool, not a performance model.
+
+---
+
+## What to carry away
+
+The story is one budget decision viewed through several ledgers.
+
+- **Write the parameter budget down.** For this decoder,
+  `P ≈ Vd + L[2d²(1+r) + 3d·d_ff]`. It immediately shows where capacity went.
+- **Write the state budget down separately.**
+  `KV bytes/token = 2L·n_kv·d_h·bytes`. MHA, GQA, and MQA can have the same hidden width and very different cache footprints.
+- **The tokenizer is an architectural decision.** A large `V` can consume a large fraction of a small model's weights, while a small `V` makes the same text longer in tokens.
+- **Do not collapse vocabulary trade-offs into one slogan.** A larger vocabulary can save KV/cache and sequence work while increasing the `d × V` output projection.
+- **A requested tokenizer vocabulary is not the same as a useful vocabulary.** In our toy trainer, the corpus stops supporting repeated merges before the requested size; another trainer could still force rarer merges.
+- **Equal parameters do not mean equal latency.** Depth adds serial stages; width changes the amount and shape of work inside each stage. Measure prefill and *real cached decode* separately — a single-token forward with no cache is neither.
+- **Active is not resident.** Sparse experts can reduce the active path while leaving a much larger set of weights that still has to live somewhere.
+- **Benchmark the exact shape on the exact serving stack.** Kernel alignment, quantization, cache layout, batching, and the output head are invisible to parameter count.
+
+If one sentence survives, make it this:
+
+> **A parameter count tells you the size of the budget. The model you deploy is determined by how you spent it.**
+
+## Where this goes next
+
+Everything in this chapter is decided before training starts.
+
+The next budget is data. At small scale, data mixture is not merely preprocessing: limited capacity forces capabilities to compete, so the distribution of training tokens decides what the model learns to spend that capacity on.
+
+## References
+
+- Liu et al., [*MobileLLM: Optimizing Sub-billion Parameter Language Models for On-Device Use Cases*](https://arxiv.org/abs/2402.14905), 2024 — deep-and-thin small-model design, embedding sharing, GQA, and the interaction between model shape and on-device inference.
+- Ainslie et al., [*GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints*](https://arxiv.org/abs/2305.13245), 2023 — grouped-query attention and the reduction in distinct K/V heads.
+- Sennrich, Haddow and Birch, [*Neural Machine Translation of Rare Words with Subword Units*](https://arxiv.org/abs/1508.07909), 2016 — BPE-style subword construction.
+- Shazeer, [*GLU Variants Improve Transformer*](https://arxiv.org/abs/2002.05202), 2020 — the three-matrix SwiGLU formulation and the `2/3` hidden-width adjustment used to match the parameter/computation budget of a conventional two-matrix FFN.

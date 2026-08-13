@@ -13,4 +13,9 @@ Inference, post-training, and scaling - how LLMs actually run and get better in 
 KV caching, FlashAttention, and continuous batching - how a trained model actually generates tokens fast.
 :::
 
+::: {.g-col-12 .g-col-md-6 .home-card}
+### [📱 Small Models](notes/llm-systems/small-models/index.qmd)
+Sub-billion parameter models - where the budget actually goes, and what it costs to deploy them.
+:::
+
 :::
