@@ -12,353 +12,351 @@ execute:
   freeze: auto
 ---
 
-Generate an image with a diffusion model and watch what the GPU actually does. It runs the same neural network, with the same weights, twenty to fifty times in a row. Each run takes the current picture and nudges it. Only after the last one do you get an image.
+Generate an image with a diffusion model and watch what the GPU does. It runs the same network, with the same weights, twenty to fifty times. Each run nudges the current picture. Only after the last one do you get an image.
 
-That should feel wasteful. It's one network and one prompt — why does it need fifty passes to produce one answer?
+That should feel wasteful. One network, one prompt — why fifty passes for one answer?
 
-The tempting explanation is that the network is simply not good enough, and that a better network would need fewer passes. That explanation is **incomplete**. We will build a case where the model is provably perfect—not approximately right, but exact—and a single-pass sampler still fails completely. The experiment isolates a second source of error that is easy to miss: even a correct local prediction can be used in a bad long-range update.
+The tempting explanation is that the network isn't good enough, and a better one would need fewer passes. That explanation is **incomplete**. Below we build a case where the model is provably exact and a single-pass sampler still fails completely. The experiment isolates a second error source that is easy to miss: a correct local prediction can be used in a bad long-range update.
 
-Once you see why that happens, the entire landscape of fast-sampling methods stops being a list of tricks and becomes a small number of obvious responses to one problem. Those are [the next post](05-fewer-steps.qmd). This one is about the problem.
+> **TL;DR** — The network answers a question about the state you have *right now*. The sampler must turn a sequence of those local answers into a complete trip from noise to image. At pure noise the correct answer is the dataset mean, so one giant step lands there even with a perfect model. Re-evaluating as the state changes lets the answer become mode-specific, then instance-specific. Sampling cost is the price of tracking a field that changes underneath you — and the error falls as $1/n$ in the number of steps, which we measure.
 
-> **TL;DR** — The network supplies a prediction that is valid at the **current** noise level; the sampler must turn a sequence of such local predictions into a complete trip from noise to image. At pure noise, the squared-error-optimal clean estimate is the dataset mean. One giant Euler step therefore collapses to that mean even when the model is exact. Re-evaluating the model as the state changes lets the estimate become mode-specific and then instance-specific. The cost of sampling comes from tracking that changing field accurately.
+## Diffusion in one paragraph
+
+Two processes, opposite directions.
+
+**Forward**: take a clean sample and progressively mix in Gaussian noise until nothing of the original remains. No network, no learning — a fixed recipe you can run in one line.
+
+**Reverse**: start from pure noise and undo that corruption to land on something that looks like data. This is the hard direction, and it is what a diffusion model is trained to enable.
+
+The asymmetry is the whole subject. The forward process needs no model and no steps. The reverse needs a network, called repeatedly. This post is about why that repetition is structural rather than an implementation detail.
 
 ## What the network actually computes
 
-A quick recap, self-contained, so the rest doesn't depend on remembering [the first diffusion post](01-diffusion-from-scratch.qmd).
+Diffusion and flow models use several noise parameterisations. To isolate the sampling problem we use the linear path
 
-Diffusion and flow models use several noise parameterisations. A DDPM usually writes the noisy state with square-root signal and noise coefficients; flow-matching models often use a linear path. To isolate the sampling problem, we will use the linear path
+$$z_t = (1-t)\,x + t\,\epsilon, \qquad t \in [0,1] \tag{1}$$
 
-$$z_t = (1-t)\,x + t\,\epsilon,$$
+with $x$ a clean sample and $\epsilon \sim \mathcal{N}(0, I)$. At $t=0$ the state is data; at $t=1$ it is pure noise. Models may predict $\epsilon$, $x$, a score, or a velocity; away from the endpoints these are algebraically interchangeable given the schedule. We use the clean-sample form and call it a **denoiser**.
 
-where $x$ is a clean sample, $\epsilon\sim\mathcal N(0,I)$ is Gaussian noise (a random vector whose coordinates are independent standard Gaussian values), and $t\in[0,1]$ is the noise level. At $t=0$ the state is data; at $t=1$ it is pure noise. The exact coefficients differ across model families, but the local-versus-finite-step issue studied below does not.
+Now the subtlety that turns out to be the whole story. Many clean samples could have produced the same noisy $z_t$ — that is what noise does. The network is trained under squared error, and the value minimising squared error against a *set* of possibilities is their average. So the network does not pick one plausible clean sample. Its optimum is the conditional average:
 
-A model may predict noise $\epsilon$, the clean sample $x$, a score, or a velocity. Away from the singular endpoint, these are algebraically convertible when the schedule is known. For example,
+$$D(z_t, t) = \mathbb{E}[x \mid z_t] \tag{2}$$
 
-$$x = \frac{z_t - t\,\epsilon}{1-t}.$$
+**The output is an average, and how much it averages over depends on the noise level.** At high noise many clean samples are consistent with $z_t$, so the average is broad; at low noise few are, so it is sharp.
 
-For intuition, we will use the clean-sample form and call it a **denoiser**: given $(z_t,t)$, it returns its best squared-error estimate of the clean sample.
+One word to fix now, because several later arguments depend on it. The prediction is **local**: valid at *this* state, at *this* noise level, and nowhere else. A sampler that treats it as valid over a long stretch of the journey is making an assumption the network never made.
 
-There's a subtlety in "best guess" that turns out to be the whole story. Many different clean images could have produced the same noisy $z_t$ — that's what noise does. The network is trained with a squared-error loss, and the value that minimises squared error against a *set* of possibilities is their **average**. So the network is not trained to choose one plausible clean image from the possibilities. Under squared error, its optimum is their conditional average. Write that as $\mathbb{E}[x \mid z_t]$: the expected value of $x$ given $z_t$.
+## A toy where the model cannot be wrong
 
-Hold onto that. **The network's output is an average, and how many things it's averaging over depends on how noisy the input is.**
+On a real model a bad one-step image has two suspects — the network guessed wrong, or the sampler misused a correct guess — and no way to separate them.
 
-## Why we need a toy
-
-Here's the difficulty with investigating this on a real model. If Stable Diffusion produces a bad image in one step, you cannot tell whose fault it is. Maybe the network's guess was wrong. Maybe the network was right and the sampler misused it. Two suspects, no way to separate them.
-
-So we'll build a case where the network cannot be wrong — where the exact denoiser is a formula we can write down. Any failure is then unambiguously the sampler's.
-
-For that we need a "dataset" simple enough to do the maths on. Ours is **two blobs**: points clustered around $(-2, 0)$ and $(+2, 0)$, each blob a small Gaussian.
+So we use data simple enough that the exact denoiser is a formula. Any failure is then unambiguously the sampler's. Our dataset is **two Gaussian blobs** at $(\pm 2, 0)$.
 
 ```{python}
 import torch, math
+import matplotlib.pyplot as plt
 torch.manual_seed(0)
 
-A = 2.0                                  # how far each blob sits from the origin
-S = 0.35                                 # blob width (standard deviation)
-MU = torch.tensor([[-A, 0.0],            # the two blob centres
-                   [ A, 0.0]])
+A = 2.0                                   # distance of each blob from the origin
+S = 0.35                                  # blob standard deviation
+MU = torch.tensor([[-A, 0.0], [A, 0.0]])  # the two centres
 
 def sample_data(n):
-    """Our 'training set': half the points near (−2,0), half near (+2,0)."""
-    which = torch.randint(0, 2, (n,))    # pick a blob per point
+    which = torch.randint(0, 2, (n,))
     return MU[which] + S * torch.randn(n, 2)
-
-data = sample_data(6)
-print("six samples from the data distribution:")
-print(data.round(decimals=2))
 ```
 
-A **Gaussian blob** simply means that points concentrate around a centre, with random offsets that are small most of the time and occasionally larger. Here `S=0.35` controls that spread. The two centres create the smallest possible dataset with a real generative choice: left mode or right mode.
+Two blobs is the smallest dataset with a real generative choice: left mode or right mode. That is the one property of real images we need — a photo is of a dog *or* a cat, not a blend, and the central difficulty in generation is committing to one. It is deliberately not a stand-in for anything else about images. Two dimensions rather than one, because a curve in 1-D is a straight line by definition and we are going to measure curvature.
 
-```{python}
-#| fig-cap: "The toy data distribution: two Gaussian modes. A useful generator must choose one mode rather than average them."
-#| code-fold: true
-import matplotlib.pyplot as plt
+### Deriving the exact denoiser
 
-cloud = sample_data(2000)
-plt.figure(figsize=(7, 3.5))
-plt.scatter(cloud[:, 0], cloud[:, 1], s=8, alpha=0.35)
-plt.scatter(MU[:, 0], MU[:, 1], marker="x", s=90, label="mode centres")
-plt.axvline(0, linewidth=0.7)
-plt.axis("equal")
-plt.xlabel("coordinate 1")
-plt.ylabel("coordinate 2")
-plt.legend()
-plt.show()
-```
+We want $\mathbb{E}[x \mid z_t]$ in closed form. Two facts make that possible.
 
-This is a legitimate stand-in for real data in one specific respect that matters here: it is **multi-modal**. Real images have categories — a photo is of a dog *or* a cat, not a blend — and the central difficulty in generation is picking one and committing. Two blobs is the smallest dataset with that property. It is deliberately *not* a stand-in for anything else about images.
+**First, the forward path keeps Gaussians Gaussian.** If $x \sim \mathcal{N}(\mu_k, S^2 I)$ then $z_t = (1-t)x + t\epsilon$ is Gaussian with
 
-Two dimensions rather than one, incidentally, because a curve in one dimension is a straight line by definition, and we're going to need to measure how much something curves.
+$$\text{mean } (1-t)\mu_k, \qquad \text{variance } \ \sigma_t^2 = (1-t)^2 S^2 + t^2 \tag{3}$$
 
-Now the exact denoiser. Given a noisy point $z_t$, the true $\mathbb{E}[x \mid z_t]$ is: work out how likely each blob is to have produced this point, work out the best guess *within* each blob, and average the two, weighted by the likelihoods. That's Bayes' rule, and for Gaussians it has a closed form:
+The centre shrinks toward the origin and the spread grows. So the noisy distribution is a mixture of two *known* Gaussians — no approximation anywhere.
+
+**Second, the question splits in two:** *which blob did this come from?* and *given that blob, where in it?*
+
+For the first, Bayes' rule over two equally likely blobs gives a posterior depending only on squared distance to each shifted centre:
+
+$$w_k(z_t) = \operatorname{softmax}_k\!\left(-\frac{\lVert z_t - (1-t)\mu_k \rVert^2}{2\sigma_t^2}\right) \tag{4}$$
+
+For the second, a Gaussian prior with a Gaussian likelihood has a Gaussian posterior whose mean is a **precision-weighted blend** of the prior centre and the rescaled observation — each pulled in proportion to how certain it is:
+
+$$m_k(z_t) = \frac{\mu_k / S^2 \;+\; (1-t)\,z_t / t^2}{1/S^2 \;+\; (1-t)^2/t^2} \tag{5}$$
+
+At small $t$ the observation term dominates and $m_k$ tracks $z_t$; at large $t$ the prior dominates and $m_k$ collapses onto $\mu_k$. Combining:
+
+$$\mathbb{E}[x \mid z_t] = \sum_k w_k(z_t)\, m_k(z_t) \tag{6}$$
 
 ```{python}
 def denoiser(z, t):
-    """The EXACT E[x | z_t] for our two-blob data. No network, no training,
-    no approximation — this is the ground-truth answer, derived from Bayes' rule.
-
-    z: (n, 2) noisy points.  t: scalar noise level in (0, 1].
-    """
+    """Exact E[x | z_t] for two-blob data — Eq. (6). No network, no training."""
     t = torch.as_tensor(t, dtype=z.dtype)
 
-    # Step 1: how likely is each blob, given where z landed?
-    # Blob k, seen through noise level t, is a Gaussian centred at (1−t)·μ_k
-    # with variance (1−t)²S² + t².  Compare z against both and normalise.
-    blur = (1 - t)**2 * S**2 + t**2
-    sq_dist = (z[:, None, :] - (1 - t) * MU).square().sum(-1)
-    blob_prob = torch.softmax(-0.5 * sq_dist / blur, dim=1)          # (n, 2)
+    var_t = (1 - t)**2 * S**2 + t**2                                 # Eq. (3)
+    sq = (z[:, None, :] - (1 - t) * MU).square().sum(-1)
+    w = torch.softmax(-0.5 * sq / var_t, dim=1)                      # Eq. (4)
 
-    # Step 2: IF the point came from blob k, what was the clean x most likely?
-    # Standard Gaussian posterior: precision-weighted blend of the blob centre
-    # and the (rescaled) observation.
     precision = 1 / S**2 + (1 - t)**2 / t**2
-    guess_per_blob = (MU / S**2 + (1 - t) * z[:, None, :] / t**2) / precision
+    m = (MU / S**2 + (1 - t) * z[:, None, :] / t**2) / precision     # Eq. (5)
 
-    # Step 3: average the two guesses, weighted by how likely each blob is.
-    return (blob_prob[..., None] * guess_per_blob).sum(1)
+    return (w[..., None] * m).sum(1)                                 # Eq. (6)
 ```
 
-Worth checking it behaves sensibly before we trust it. We choose one clean point and one fixed noise vector, then inspect the *same forward corruption path* at several noise levels:
+Drawn as a map — each arrow runs from a point in space to the clean sample the denoiser predicts for it:
 
 ```{python}
-x_true = torch.tensor([[1.8, 0.1]])
-eps_true = torch.tensor([[0.5, -0.3]])
+#| fig-cap: "The denoiser's answer sharpens as noise falls. At t=0.99 every input maps to essentially one point, the dataset mean. At t=0.85 the answers split in two. At t=0.4 they are specific to the input."
+#| code-fold: true
+fig, axes = plt.subplots(1, 3, figsize=(11, 3.2))
+gx, gy = torch.meshgrid(torch.linspace(-4, 4, 13), torch.linspace(-2, 2, 7), indexing="ij")
+grid = torch.stack([gx.reshape(-1), gy.reshape(-1)], 1)
 
-print(f"{'t':>5} {'noisy state z_t':>24} {'denoiser E[x|z_t]':>28}")
-for t in [0.05, 0.30, 0.60, 0.90, 1.00]:
-    t_tensor = torch.tensor(t)
-    z_t = (1 - t_tensor) * x_true + t_tensor * eps_true
-    guess = denoiser(z_t, t_tensor)
-    print(f"{t:>5.2f} "
-          f"({z_t[0,0]:>+7.3f}, {z_t[0,1]:>+7.3f})   "
-          f"({guess[0,0]:>+7.3f}, {guess[0,1]:>+7.3f})")
+for ax, t in zip(axes, [0.99, 0.85, 0.40]):
+    d = denoiser(grid, torch.tensor(t))
+    ax.quiver(grid[:, 0], grid[:, 1], (d - grid)[:, 0], (d - grid)[:, 1],
+              angles="xy", scale_units="xy", scale=1, width=0.004, alpha=0.75)
+    ax.scatter(MU[:, 0], MU[:, 1], marker="x", s=70, c="crimson", zorder=3)
+    ax.set_title(f"t = {t}"); ax.set_xlim(-4.5, 4.5); ax.set_ylim(-2.4, 2.4)
+    ax.set_xticks([]); ax.set_yticks([])
+plt.tight_layout(); plt.show()
 ```
 
-At very low noise the estimate is close to the particular point. At intermediate noise it still identifies the right blob but pulls toward that blob's centre, because the exact offset is uncertain. Near pure noise even the blob identity disappears, and at $t=1$ the estimate is the global mean. The denoiser therefore changes from **instance-specific** to **mode-specific** to **global** as noise increases.
+Three regimes, worth naming because the rest of the post uses the terms:
 
-**That changing level of specificity is the mechanism behind everything in this post.**
+| noise level | the denoiser's answer is | called |
+|---|---|---|
+| $t \to 1$ | the mean of the whole dataset | **global** |
+| middling $t$ | the centre of one blob | **mode-specific** |
+| $t \to 0$ | this particular point | **instance-specific** |
 
-## Sampling, and the one-step catastrophe
+**That changing specificity is the mechanism behind everything below.**
 
-Sampling runs the process backwards. Start from pure noise at $t=1$ and work toward data at $t=0$, repeatedly asking how the state should change.
+## Trajectories and the velocity field
 
-A useful mental model is a **vector field**: imagine an arrow attached to every possible noisy state. The arrow says how that state changes as the noise level $t$ increases. **Integrating** the field means following these arrows through many short intervals. Generation walks in the opposite time direction—from high $t$ to low $t$—so each time increment is negative.
+To sample we must move, so we need a direction. Differentiate the path (1):
 
-For deterministic diffusion and flow samplers, the loop is:
+$$\frac{dz_t}{dt} = \epsilon - x \tag{7}$$
 
-1. estimate the clean and noise components at the current state;
-2. convert them into a local velocity;
-3. take a short step toward a lower noise level;
-4. evaluate again, because the velocity may have changed.
+That is the **velocity**: the rate at which a state moves as noise increases. Sampling runs the other way, so we follow $-dz_t/dt$.
 
-Written as code:
+We do not know the particular $x$ and $\epsilon$ behind a given state — that is exactly what the noise destroyed. So we substitute their conditional averages: $\hat{x} = D(z_t,t)$ from Eq. (6), and the noise implied by the path, $\hat{\epsilon} = (z_t - (1-t)\hat{x})/t$.
 
 ```{python}
-T_START, T_END = 1.0, 1e-3               # t=1 is pure noise; we stop just short of 0
+T_START, T_END = 1.0, 1e-3
 
 def velocity(z, t):
-    """Exact marginal velocity in the increasing-t direction.
-
-    For the linear path, dz/dt = ε − x.  We do not know the particular x and ε,
-    so we use their conditional means given the current state.  Sampling moves
-    from t=1 toward t=0, so the negative time step automatically follows the
-    opposite direction—away from noise and toward data.
-    """
+    """Eq. (7) with conditional means substituted for the unknown x and ε."""
     t = torch.as_tensor(t, dtype=z.dtype).clamp(min=1e-3)
-    x_hat = denoiser(z, t)                       # estimated clean part
-    eps_hat = (z - (1 - t) * x_hat) / t          # implied noise part
+    x_hat = denoiser(z, t)
+    eps_hat = (z - (1 - t) * x_hat) / t
     return eps_hat - x_hat
+```
 
+Attach that arrow to every point in space and you have a **velocity field**. A **trajectory** is the path traced by following it: forward, a clean sample dissolving into noise; reverse, a noise sample resolving into data. Generation walks a reverse trajectory.
+
+The field is local in both arguments — it depends on where you are *and* on the current noise level. Two consequences, and both are why one evaluation cannot suffice: the arrow at your current position tells you nothing about the arrow further along, and the whole field is different at every $t$.
+
+## Euler steps, and why more of them help
+
+Following a continuous path exactly would take infinitely many evaluations. Instead we take finite jumps. The **Euler step** is the simplest: read the velocity where you are, assume it holds for the whole interval, move.
+
+$$z_{t+h} = z_t + h \cdot v(z_t, t) \tag{8}$$
+
+The assumption is written into the formula, and it is false whenever the velocity changes along the interval. The resulting error is **discretisation error** — the cost of replacing a curve with a finite number of straight jumps. It has nothing to do with the model being wrong.
+
+This also answers how local estimates ever produce a globally correct result. Individually they do not. Each step is wrong by however much the velocity changed across it. Halve the step and you roughly halve that change, so error per step halves — but you take twice as many steps, so the *total* halves rather than quartering. That is first-order convergence: error $\propto 1/n$.
+
+```{python}
 def sample(z, n_steps):
-    """Walk from t=1 down to t≈0 in n_steps equal moves."""
+    """Walk from t=1 to t≈0 in n_steps equal Euler moves — Eq. (8)."""
     ts = torch.linspace(T_START, T_END, n_steps + 1)
     for i in range(n_steps):
-        step_size = ts[i + 1] - ts[i]            # negative: t decreases
-        z = z + step_size * velocity(z, ts[i])
+        z = z + (ts[i + 1] - ts[i]) * velocity(z, ts[i])
     return z
+
+start = torch.randn(3000, 2)
+reference = sample(start.clone(), 8000)      # fine enough to count as exact
+
+print(f"{'steps':>7}{'mean distance from reference':>32}{'improvement':>14}")
+prev = None
+for n in [1, 2, 4, 8, 16, 32, 64, 128]:
+    err = (sample(start.clone(), n) - reference).norm(dim=-1).mean().item()
+    print(f"{n:>7}{err:>32.4f}{'' if prev is None else f'{prev/err:>13.2f}x'}")
+    prev = err
 ```
 
-Everything here is exact except one thing: **each move assumes the direction stays constant for the whole length of that move.** With many small moves that's a mild assumption. With one giant move it is not.
+From eight steps onward the improvement is a clean factor of two per doubling: exactly the $1/n$ law. That last column is the honest answer to "why fifty" — each doubling buys a halving, so you stop once the residual falls below what you can see.
 
-Watch what happens:
+## The one-step catastrophe
+
+Now the extreme case: a single Euler step across the entire journey, with an exact denoiser, against a well-resolved run.
+
+If the model were the only thing that mattered, one step should give a blurry but recognisable version of the data — points somewhere near each blob. Watch instead.
 
 ```{python}
-def fraction_near_a_blob(x):
-    """Fraction of points landing within radius 3σ of either blob centre.
+careful = sample(start.clone(), 4000)
+single = sample(start.clone(), 1)
 
-    Careful with the threshold: the familiar 99.7% is the ONE-dimensional
-    figure. For a 2-D isotropic Gaussian the radial distance is Rayleigh, and
-    P(‖x − μ‖ < 3σ) = 1 − exp(−9/2) ≈ 98.9%. That is the ceiling here.
-    """
-    distance_to_nearest = (x[:, None, :] - MU).norm(dim=-1).min(dim=1).values
-    return (distance_to_nearest < 3 * S).float().mean()
+def near_a_blob(x):
+    """Fraction within 3σ of either centre. In 2-D the radial distance is
+    Rayleigh, so the ceiling is 1 − exp(−9/2) ≈ 98.9%, not the 1-D 99.7%."""
+    return ((x[:, None, :] - MU).norm(dim=-1).min(1).values < 3 * S).float().mean()
 
-start = torch.randn(6000, 2)               # 6000 draws of pure noise
-careful = sample(start.clone(), 4000)      # 4000 tiny steps — our reference
-single  = sample(start.clone(), 1)         # one giant step
-
-print(f"4000 steps: {fraction_near_a_blob(careful):.1%} of samples land near a blob")
-print(f"   1 step : {fraction_near_a_blob(single):.1%} of samples land near a blob")
-print(f"\nwhere did the one-step samples go? "
-      f"mean ({single[:,0].mean():+.3f}, {single[:,1].mean():+.3f}), "
-      f"spread {single.std(0).max():.4f}")
+print(f"{'sampler':>12}{'near a blob':>14}{'spread':>10}{'mean position':>20}")
+for name, out in [("4000 steps", careful), ("1 step", single)]:
+    print(f"{name:>12}{near_a_blob(out):>13.1%}{out.std(0).max():>10.4f}"
+          f"{f'({out[:,0].mean():+.3f}, {out[:,1].mean():+.3f})':>20}")
 ```
 
-Not degraded — **annihilated**. Every one of the six thousand samples landed on essentially the same point, the origin, which is the average of the two blobs and a location the data never occupies. In image terms: every prompt, every seed, the same grey mush.
+```{python}
+#| fig-cap: "Left: 4000 steps recovers both modes. Right: one step puts every sample on the origin — a location the data never occupies."
+#| code-fold: true
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.0), sharex=True, sharey=True)
+cloud = sample_data(2000)
+for ax, (name, out) in zip(axes, [("4000 steps", careful), ("1 step", single)]):
+    ax.scatter(cloud[:, 0], cloud[:, 1], s=6, alpha=0.15, label="data")
+    ax.scatter(out[:800, 0], out[:800, 1], s=6, alpha=0.5, c="crimson", label="samples")
+    ax.set_title(name); ax.set_xlim(-4, 4); ax.set_ylim(-2, 2)
+    ax.set_xticks([]); ax.set_yticks([])
+axes[0].legend(loc="upper left", fontsize=8)
+plt.tight_layout(); plt.show()
+```
 
-And the denoiser was exact. There is no network to blame.
+Not degraded — **annihilated**. Every sample landed on essentially the same point, the average of the two blobs, a location the data never occupies. In image terms: every prompt, every seed, the same grey mush. And the denoiser was exact.
 
-## Why: the honest answer at $t=1$ is the average of everything
+### Why: at $t=1$ the honest answer is the average of everything
 
-The explanation is short once you ask the right question. What is $\mathbb{E}[x \mid z_1]$ — the denoiser's answer at the very start?
-
-At $t=1$ the state is pure noise and, under the independent data–noise pairing used for training, it contains no information about the particular clean sample paired with it. The denoiser is being asked "which clean point was paired with this noise?" when every clean point is equally possible. Its best guess, in the squared-error sense, is the average of everything it has ever seen.
-
-Not approximately. Exactly:
+At $t=1$ the state is pure noise. Under the independent pairing used in training it carries no information about which clean sample it was paired with. Asked "which $x$ produced this?", every $x$ is equally consistent, and the squared-error-optimal answer is the average of all of them.
 
 ```{python}
-lots_of_noise = torch.randn(50_000, 2)
-guesses = denoiser(lots_of_noise, torch.tensor(1.0))
-
-print("the denoiser's output for 50,000 DIFFERENT random inputs:")
-print(f"   x-coordinate ranges from {guesses[:,0].min():.2e} to {guesses[:,0].max():.2e}")
-print(f"   total spread across all 50,000: "
+guesses = denoiser(torch.randn(50_000, 2), torch.tensor(1.0))
+print(f"spread of outputs over 50,000 different noise inputs at t=1: "
       f"{(guesses.max(0).values - guesses.min(0).values).max():.2e}")
-print(f"   the mean of the dataset is (0.0, 0.0)")
+print(f"the output: ({guesses[0,0]:.3f}, {guesses[0,1]:.3f})   [= the dataset mean]")
 ```
 
-Zero spread. Fifty thousand different starting points, one identical answer.
+Zero spread. The single step was therefore not a rough approximation of a good move. It was an accurate move in the one direction that was genuinely correct *at that instant*, extended across the entire journey.
 
-So the single step wasn't a rough approximation of the right move. It was a *precise* move in a direction that correctly points at the average of the whole dataset — because at that moment, that is genuinely the best available answer. The sampler didn't misread the network. It read it correctly and then extrapolated a locally-correct answer across the entire journey.
+> **The denoiser gives a locally valid answer. A sampling step converts it into a finite-distance move. The gap between those is the entire cost of generation.**
 
-This is the distinction the rest of the series depends on:
+## What changes along the way
 
-> **The denoiser gives a locally valid answer. A sampling step converts it into a finite-distance move. Those are different things, and the gap between them is the entire cost of generation.**
+If the answer at $t=1$ is useless and the answer at $t=0$ is the image, something happens in between. Two clarifications before measuring it.
 
-In this exact-field experiment, the failure is not model error. It is **discretisation error**—the error introduced by replacing a continuous trajectory with a finite number of updates. Real models contain both learned-field error and discretisation error, but the toy lets us expose the second one in isolation.
+**The sampler creates no information.** It is deterministic — $z_1$ already fixes the output. What changes is how much of that the denoiser can *resolve* at the current noise level.
 
-## Where the information comes from
-
-If the answer at $t=1$ is useless, and the answer at $t=0$ is the image, something must happen in between. Watching it happen turns out to be more interesting than expected.
-
-One clarification first, because it's easy to get backwards. **The sampler is deterministic and creates no information.** The starting noise $z_1$ already determines the final image completely — same seed, same output, every time. What changes along the way is not how much information exists, but how much of it the *denoiser can see*. Early on it can't distinguish the seeds; later it can.
-
-To measure that, we follow individual trajectories and ask, at each point, how well the denoiser's guess predicts where that particular path eventually ends up:
+**A single correlation would mislead.** The blobs sit four units apart, so any estimate that gets the left/right choice right correlates strongly with the endpoint regardless of whether it knows anything finer. So we track two things separately: whether the denoiser has picked the correct blob, and whether it knows the offset *within* that blob.
 
 ```{python}
 def trajectory(z, n_steps=600):
-    """Record the full path, using small enough steps to be essentially exact."""
+    """Heun (predict, re-evaluate, average) — accurate enough that these count
+    as the true trajectories rather than an approximation of them."""
     ts = torch.linspace(T_START, T_END, n_steps + 1)
     path = [z.clone()]
     for i in range(n_steps):
         h = ts[i + 1] - ts[i]
         v = velocity(z, ts[i])
-        z_predicted = z + h * v                       # look ahead...
-        z = z + h * 0.5 * (v + velocity(z_predicted, ts[i + 1]))   # ...and average
+        z = z + h * 0.5 * (v + velocity(z + h * v, ts[i + 1]))
         path.append(z.clone())
     return torch.stack(path), ts
 
 torch.manual_seed(0)
 paths, ts = trajectory(torch.randn(2000, 2))
-final_x = paths[-1][:, 0]                             # where each path ended up
-```
+final_x = paths[-1][:, 0]
+which_blob = torch.where(final_x >= 0, 1.0, -1.0)
+within_blob = final_x - which_blob * A
 
-Now, a naive correlation between the denoiser's guess and the final answer would be misleading here, and it's worth seeing why. Our two blobs sit four units apart, so *any* estimate that gets the left/right choice correct will correlate strongly with the endpoint, regardless of whether it knows anything about the specific point within the blob. So we separate the two questions:
-
-```{python}
-which_blob = torch.where(final_x >= 0, 1.0, -1.0)     # +1 = right blob, −1 = left
-within_blob = final_x - which_blob * A                # offset from the blob centre
-
-print(f"{'noise level':>12} {'picked the right blob':>23} {'knows the offset':>19}")
+print(f"{'t':>6}{'correct blob':>15}{'knows offset':>15}")
 for t_target in [0.95, 0.90, 0.80, 0.60, 0.40, 0.20]:
     k = int((ts - t_target).abs().argmin())
-    guess = denoiser(paths[k], ts[k])[:, 0]
-
-    blob_correct = (torch.where(guess >= 0, 1.0, -1.0) == which_blob).float().mean()
-    offset_corr = torch.corrcoef(
-        torch.stack([guess - which_blob * A, within_blob]))[0, 1]
-
-    print(f"{t_target:>12.2f} {blob_correct:>22.0%} {offset_corr:>19.2f}")
+    g = denoiser(paths[k], ts[k])[:, 0]
+    acc = (torch.where(g >= 0, 1.0, -1.0) == which_blob).float().mean()
+    corr = torch.corrcoef(torch.stack([g - which_blob * A, within_blob]))[0, 1]
+    print(f"{t_target:>6.2f}{acc:>14.0%}{corr:>15.2f}")
 ```
 
-*(We start at $t=0.95$ rather than $t=1.00$: at exactly 1 the guess is identically zero, which makes both columns meaningless — the "blob choice" would be a coin flip on a tie, and the offset column would be measuring the blob label rather than the offset.)*
+*(Starting at $t=0.95$: at exactly 1 the guess is identically zero, which makes both columns meaningless.)*
 
-**The two happen on completely different timescales.** By $t=0.95$ — after 5% of the journey — the denoiser already knows which blob every single trajectory will end in. But it has almost no idea *where in that blob*: the offset correlation is 0.09. That knowledge accumulates slowly, reaching 0.76 at $t=0.60$ and 0.90 at $t=0.40$.
+**Two completely different timescales.** After 5% of the journey the denoiser already knows which blob every trajectory will end in — and has almost no idea where within it. That second kind of knowledge accumulates across the rest of the trip.
 
-The category is settled almost immediately. The specifics take most of the trajectory.
-
-If that pattern holds for real image models — and this is a two-blob toy, so treat it as a hypothesis rather than a finding — it explains a familiar experience: nudging the seed a little tends to change the details of an image while leaving its overall composition intact, because the composition was decided in the first few steps and everything after was refinement.
+The category is settled almost immediately; the specifics take most of the journey. If that holds for real image models — a two-blob toy, so treat it as a hypothesis — it explains why nudging a seed tends to change details while leaving composition intact.
 
 ## Why one large step fails: the velocity changes
 
-One more measurement, because it sets up the whole of the next post.
+Discretisation error is exactly the amount the velocity changes across a step. That change has two independent parts, and both cost you.
 
-If the denoiser's estimate changes as we travel, then the velocity changes too. That change may alter the **direction**, the **speed**, or both. A single Euler step assumes neither changes across the interval.
-
-Geometric bending is the easiest part to see, so we measure it first: how far does each trajectory bow away from the straight chord joining its endpoints?
-
-We compare each trajectory against the straight line between its own start and end — the shortest route it could possibly have taken — and measure the biggest sideways departure:
+**Direction — the path bends.** Measure it against the straight chord between each trajectory's own endpoints: project every point on the path onto that chord, then take the perpendicular residual. The largest such residual, as a fraction of the chord length, says how far the path bows from the shortest available route.
 
 ```{python}
 start_pt, end_pt = paths[0], paths[-1]
-straight_line = end_pt - start_pt                       # the direct route
+chord = end_pt - start_pt
+along = (((paths - start_pt[None]) * chord[None]).sum(-1)
+         / chord.square().sum(-1).clamp_min(1e-8)[None])
+perpendicular = (paths - (start_pt[None] + along[..., None] * chord[None])).norm(dim=-1)
+bend = perpendicular.max(0).values / chord.norm(dim=-1)
 
-# Project every point on the path onto the straight line, then measure how far
-# off to the side it sits. (No clamping: we want distance to the infinite line,
-# so the measurement is a genuine perpendicular distance everywhere.)
-line_len_sq = straight_line.square().sum(-1).clamp_min(1e-8)
-how_far_along = ((paths - start_pt[None]) * straight_line[None]).sum(-1) / line_len_sq[None]
-closest_point_on_line = start_pt[None] + how_far_along[..., None] * straight_line[None]
-
-sideways = (paths - closest_point_on_line).norm(dim=-1).max(0).values
-print(f"biggest sideways departure, as a fraction of the direct distance:")
-print(f"   median {(sideways / straight_line.norm(dim=-1)).median():.2f}")
+speed = torch.stack([velocity(paths[k], ts[k]).norm(dim=-1).mean()
+                     for k in range(0, 601, 10)])
+print(f"median bend, as a fraction of the direct distance : {bend.median():.2f}")
+print(f"speed varies along the path by a factor of        : {speed.max()/speed.min():.2f}x")
 ```
+
+The path bows by roughly a sixth of the endpoint distance, toward the mode it eventually commits to. A single step follows only the initial velocity, which points at the dataset average instead.
 
 ```{python}
-#| fig-cap: "A subset of exact trajectories. Dashed chords show the direct start-to-end route; the curved paths show what the sampler must track."
+#| fig-cap: "Three trajectories (blue) with Euler steps overlaid (red). One step leaves the data entirely and converges on the origin; four steps begin to track the curve."
 #| code-fold: true
-show = torch.linspace(0, paths.shape[1] - 1, 24).long()
-plt.figure(figsize=(8, 4.5))
-for j in show:
-    plt.plot(paths[:, j, 0], paths[:, j, 1], linewidth=1)
-    plt.plot([start_pt[j, 0], end_pt[j, 0]],
-             [start_pt[j, 1], end_pt[j, 1]],
-             linestyle="--", linewidth=0.7, alpha=0.45)
-plt.scatter(start_pt[show, 0], start_pt[show, 1], marker=".", label="noise start")
-plt.scatter(end_pt[show, 0], end_pt[show, 1], marker="x", label="data endpoint")
-plt.axvline(0, linewidth=0.6)
-plt.axis("equal")
-plt.xlabel("coordinate 1")
-plt.ylabel("coordinate 2")
-plt.legend()
-plt.show()
+torch.manual_seed(3)
+z0 = torch.tensor([[1.1, 0.9], [-0.7, -1.0], [0.4, 1.3]])
+true_path, _ = trajectory(z0.clone())
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.5), sharex=True, sharey=True)
+for ax, n in zip(axes, [1, 4]):
+    tt = torch.linspace(T_START, T_END, n + 1)
+    z, pts = z0.clone(), [z0.clone()]
+    for i in range(n):
+        z = z + (tt[i + 1] - tt[i]) * velocity(z, tt[i]); pts.append(z.clone())
+    E = torch.stack(pts)
+    for j in range(z0.shape[0]):
+        ax.plot(true_path[:, j, 0], true_path[:, j, 1], lw=1.6, alpha=0.85, color="#2C4F6B")
+        for i in range(n):
+            d = E[i + 1, j] - E[i, j]
+            ax.arrow(float(E[i, j, 0]), float(E[i, j, 1]), float(d[0]), float(d[1]),
+                     head_width=0.09, length_includes_head=True, color="#B23A3A", alpha=0.9)
+    ax.scatter(MU[:, 0], MU[:, 1], marker="x", s=70, c="k", zorder=3)
+    ax.set_title(f"{n} Euler step{'s' if n > 1 else ''}")
+    ax.set_xlim(-3.6, 3.6); ax.set_ylim(-1.9, 1.9); ax.set_xticks([]); ax.set_yticks([])
+plt.tight_layout(); plt.show()
 ```
 
-The path bows away from its direct endpoint chord by roughly one-sixth to one-fifth of the endpoint displacement in this run. A single step follows only the initial velocity, which points toward the dataset average rather than either mode.
+**Speed — the path is not covered at a uniform rate.** This part is less intuitive, so worth being explicit: even a perfectly straight path defeats a single Euler step if it is traversed at a varying rate, because the step assumes one constant velocity and will overshoot or undershoot. Here the speed varies by a factor of about 2.7.
 
-One technical distinction matters: geometric straightness alone is not sufficient. A path can lie on a straight line while moving along it at a non-uniform speed. One Euler step is exact only when the trajectory is **affine in time**, equivalently when its velocity is constant over the interval. The real cost is therefore paid whenever the velocity changes—through bending, changing speed, or both.
+The precise condition is that one Euler step is exact only when the trajectory is **affine in time** — a straight line covered at constant speed. *Geometric straightness* alone is not enough. In 2-D that is easy to picture; for images the same statement holds in pixel or latent space, where "straight" means the intermediate states are a constant-rate blend of the endpoints.
 
 ## What to carry away
 
-- **The network answers a narrow question**: given this noisy input, what is the *average* clean point consistent with it? Not a plausible sample — the average.
-- **How much it averages over depends on the noise level.** At $t=1$ the state carries no information about the *independently paired* clean training sample, so the answer is the mean of the entire dataset — provably, with zero spread across 50,000 different inputs.
-- **The one-step collapse is not model error.** With a perfect denoiser, one step still lands on the dataset mean, because it takes a locally-correct direction and extends it across the entire journey. That is discretisation error, which is a numerical problem with numerical answers.
-- **Sampling doesn't create information** — the seed fixes the output. What changes is how much of it the denoiser can resolve at the current noise level.
-- **Category first, detail later.** In this toy the correct blob is picked within 5% of the trajectory while positioning within it takes more than half. Coarse decisions early, refinement late.
-- **The velocity changes along the journey.** In this toy the geometric path bows by about 17% of the direct endpoint distance, and its speed changes as well. Steps are the price of tracking that variation.
+- **The network answers a narrow question**: given this noisy input, what is the *average* clean sample consistent with it. Not a plausible sample — the average.
+- **How much it averages over depends on noise.** At $t=1$ the answer is the dataset mean, with zero spread across 50,000 inputs; then mode-specific; then instance-specific.
+- **The one-step collapse is not model error.** With a perfect denoiser one step still lands on the mean, because a locally correct direction was extended across the whole journey. That is discretisation error — a numerical problem with numerical answers.
+- **Error falls as $1/n$.** Measured: a clean factor of two per doubling of steps. That is what makes "fifty" a budget rather than a magic number.
+- **Sampling creates no information.** The seed fixes the output; what changes is how much the denoiser can resolve.
+- **Category first, detail later.** The correct blob is decided within 5% of the trajectory; position within it takes most of the rest.
+- **Two things vary along the way.** The path bends by about a sixth of the endpoint distance and its speed changes by about 2.7×. One step is exact only if neither happens.
 
-If one sentence survives: *the model tells you how to move from the state you have now; the sampler pays repeated network calls to turn those local answers into an accurate finite journey.*
+If one sentence survives: *the model tells you how to move from the state you have now, and the sampler pays repeated network calls to turn those local answers into an accurate finite journey.*
 
 ## Where this goes next
 
-We now have the problem stated precisely: a changing velocity forces repeated evaluations, and repeated evaluations cost network calls. That framing makes the entire fast-sampling literature legible, because there turn out to be only three things you can do about it — **follow the curve more cleverly, make the curve straighter, or learn a shortcut that skips it**. [The next post](05-fewer-steps.qmd) works through all three, including a result that catches people out: a mathematically better solver can be *worse* than a crude one when the step count is very low.
+The problem is now stated precisely: a changing velocity forces repeated evaluation, and repeated evaluation costs network calls. That makes the fast-sampling literature legible, because there are only three responses — **follow the curve more cleverly, make the curve straighter, or learn a shortcut past it**. [The next post](05-fewer-steps.qmd) works through all three, including a result that catches people out: a mathematically better solver can be *worse* than a crude one at very low step counts.
 
 ## References
 
 - Ho, Jain & Abbeel, [*Denoising Diffusion Probabilistic Models*](https://arxiv.org/abs/2006.11239), 2020 — the training objective recapped above.
-- Song et al., [*Score-Based Generative Modeling through SDEs*](https://arxiv.org/abs/2011.13456), 2021 — where the "sampling is solving a differential equation" view comes from.
-- Lipman et al., [*Flow Matching for Generative Modeling*](https://arxiv.org/abs/2210.02747), 2022 — the straight-line mixing and velocity formulation used here, which is the cleanest way to write all of this.
-- Karras et al., [*Elucidating the Design Space of Diffusion-Based Generative Models*](https://arxiv.org/abs/2206.00364), 2022 — separates the model, the noise schedule and the sampler into independent choices. The paper that makes this whole area legible.
+- Song et al., [*Score-Based Generative Modeling through SDEs*](https://arxiv.org/abs/2011.13456), 2021 — where "sampling is solving a differential equation" comes from.
+- Lipman et al., [*Flow Matching for Generative Modeling*](https://arxiv.org/abs/2210.02747), 2022 — the linear path and velocity formulation used here.
+- Karras et al., [*Elucidating the Design Space of Diffusion-Based Generative Models*](https://arxiv.org/abs/2206.00364), 2022 — separates model, schedule and sampler into independent choices.
