@@ -24,6 +24,15 @@ jobs:
       - name: Set up Quarto
         uses: quarto-dev/quarto-actions/setup@v2
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install --index-url https://download.pytorch.org/whl/cpu -r requirements.txt --extra-index-url https://pypi.org/simple
+
       - name: Fetch total pageview count from GoatCounter
         env:
           GOATCOUNTER_API_TOKEN: ${{ secrets.GOATCOUNTER_API_TOKEN }}

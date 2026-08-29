@@ -1,0 +1,7 @@
+jupyter
+nbformat
+nbclient
+ipykernel
+matplotlib
+numpy
+torch
