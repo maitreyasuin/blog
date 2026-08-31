@@ -10,6 +10,7 @@ format:
     code-fold: false
 execute:
   freeze: auto
+draft: true
 ---
 
 Ask what separates diffusion from flow matching and you will usually get some version of *diffusion is stochastic denoising, flow matching is deterministic transport*. It is a tidy answer and it is not where the boundary is. Diffusion has had a deterministic sampler since 2020, and flow matching works perfectly well on the same Gaussian paths diffusion uses.

@@ -10,6 +10,7 @@ format:
     code-fold: false
 execute:
   freeze: auto
+draft: true
 ---
 
 [The previous post](05-fewer-steps.qmd) showed how sampling can fall from dozens of denoiser evaluations to one to four. That may be a 12–50× reduction in NFE, but it is not automatically a 12–50× reduction in the latency a user sees.
